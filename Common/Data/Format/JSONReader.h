@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -19,7 +20,8 @@ struct JsonGet {
 		return get(child_name, JSON_ARRAY);
 	}
 	const JsonGet getDict(const char *child_name) const {
-		return JsonGet(get(child_name, JSON_OBJECT)->value);
+		const JsonNode *node = get(child_name, JSON_OBJECT);
+		return node ? JsonGet(node->value) : JsonGet(JSON_NULL);
 	}
 	const char *getStringOrNull(const char *child_name) const;
 	const char *getStringOr(const char *child_name, const char *default_value) const;

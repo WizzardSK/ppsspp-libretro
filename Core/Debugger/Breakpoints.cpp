@@ -61,9 +61,10 @@ BreakAction MemCheck::Apply(u32 addr, bool write, int size, u32 pc) {
 	return BREAK_ACTION_NONE;
 }
 
-BreakAction MemCheck::Action(u32 addr, bool write, int size, u32 pc, const char *reason) {
+BreakAction MemCheck::Action(u32 addr, bool write, int size, u32 pc, const char *reason, bool skipPause) {
 	// Conditions have always already been checked if we get here.
 	Log(addr, write, size, pc, reason);
+	const BreakAction action = skipPause ? BreakAction(this->action & ~BREAK_ACTION_PAUSE) : this->action;
 
 	BreakpointHit hit;
 	if (WebSocketDebuggerHasClients() || (action & BREAK_ACTION_PAUSE)) {
@@ -320,6 +321,7 @@ void BreakpointManager::ChangeBreakPointAddCond(u32 addr, const BreakPointCond &
 		breakPoints_[bp].hasCond = true;
 		breakPoints_[bp].cond = cond;
 		currentMIPS->InvalidateICacheRangeDeferred(addr - 4, 8);
+		System_Notify(SystemNotification::DISASSEMBLY);
 	}
 }
 
@@ -328,6 +330,7 @@ void BreakpointManager::ChangeBreakPointRemoveCond(u32 addr) {
 	if (bp != INVALID_BREAKPOINT) {
 		breakPoints_[bp].hasCond = false;
 		currentMIPS->InvalidateICacheRangeDeferred(addr - 4, 8);
+		System_Notify(SystemNotification::DISASSEMBLY);
 	}
 }
 
@@ -356,11 +359,15 @@ BreakAction BreakpointManager::ExecBreakPoint(u32 addr) {
 
 	BreakAction result = BREAK_ACTION_NONE;
 	BreakpointHit hit;
+	const bool skipPause = SkipPauseAt(addr);
 
 	size_t bp = FindBreakpoint(addr);
-	if (bp != INVALID_BREAKPOINT) {
+	if (bp != INVALID_BREAKPOINT && !SkipReportAt(addr)) {
 		BreakPoint &info = breakPoints_[bp];
-		const BreakAction action = info.action;
+		BreakAction action = info.action;
+		if (skipPause) {
+			action = BreakAction(action & ~BREAK_ACTION_PAUSE);
+		}
 
 		bool condPassed = true;
 		if (info.hasCond)
@@ -402,7 +409,7 @@ BreakAction BreakpointManager::ExecBreakPoint(u32 addr) {
 		}
 	}
 
-	if (tempBreakPoint_.valid && tempBreakPoint_.addr == addr) {
+	if (tempBreakPoint_.valid && tempBreakPoint_.addr == addr && !skipPause) {
 		// The condition, when set, narrows down which hit counts - to one thread for a step
 		// ("threadid == ..."), or to a later frame for run-to-cursor ("flipcount > ...").  A hit that
 		// fails it leaves the breakpoint armed, so the next one gets a chance.
@@ -416,6 +423,9 @@ BreakAction BreakpointManager::ExecBreakPoint(u32 addr) {
 		// hit stays kind None when only the temporary breakpoint fired - there's no user
 		// breakpoint to describe in that case, just a step completing.
 		Core_Break(BreakReason::CpuBreakpoint, addr, hit.kind != BreakpointKind::None ? &hit : nullptr);
+		if (hit.kind != BreakpointKind::None) {
+			NoteStoppedOnReport(addr);
+		}
 		System_Notify(SystemNotification::DISASSEMBLY);
 	}
 
@@ -438,6 +448,7 @@ int BreakpointManager::AddMemCheck(u32 start, u32 end, MemCheckCondition cond, B
 		}
 		updateMemChecks_ = true;
 		currentMIPS->ClearJitCacheDeferred();  // memchecks apply to all memory accesses
+		System_Notify(SystemNotification::DISASSEMBLY);
 		return (int)memChecks_.size() - 1;
 	} else {
 		// Update with additional cond and action bits. Not sure if we should OR or override?
@@ -449,6 +460,7 @@ int BreakpointManager::AddMemCheck(u32 start, u32 end, MemCheckCondition cond, B
 		}
 		updateMemChecks_ = true;
 		currentMIPS->ClearJitCacheDeferred();  // memchecks apply to all memory accesses
+		System_Notify(SystemNotification::DISASSEMBLY);
 		return (int)mc;
 	}
 }
@@ -464,6 +476,7 @@ void BreakpointManager::RemoveMemCheck(u32 start, u32 end)
 			MemBlockReleaseDetailed();
 		updateMemChecks_ = true;
 		currentMIPS->ClearJitCacheDeferred();  // memchecks apply to all memory accesses
+		System_Notify(SystemNotification::DISASSEMBLY);
 	}
 }
 
@@ -476,6 +489,7 @@ void BreakpointManager::ChangeMemCheck(u32 start, u32 end, MemCheckCondition con
 		memChecks_[mc].action = action;
 		updateMemChecks_ = true;
 		currentMIPS->ClearJitCacheDeferred();  // memchecks apply to all memory accesses
+		System_Notify(SystemNotification::DISASSEMBLY);
 	}
 }
 
@@ -498,6 +512,7 @@ void BreakpointManager::ChangeMemCheckAddCond(u32 start, u32 end, const BreakPoi
 		memChecks_[mc].hasCondition = true;
 		memChecks_[mc].condition = cond;
 		// No need to update jit for a condition add/remove, they're not baked in.
+		System_Notify(SystemNotification::DISASSEMBLY);
 	}
 }
 
@@ -506,6 +521,7 @@ void BreakpointManager::ChangeMemCheckRemoveCond(u32 start, u32 end) {
 	if (mc != INVALID_MEMCHECK) {
 		memChecks_[mc].hasCondition = false;
 		// No need to update jit for a condition add/remove, they're not baked in.
+		System_Notify(SystemNotification::DISASSEMBLY);
 	}
 }
 
@@ -569,7 +585,7 @@ MemCheck *BreakpointManager::FindMemCheckInRange(u32 address, int size) {
 
 BreakAction BreakpointManager::ExecMemCheck(u32 address, bool write, int size, u32 pc, const char *reason)
 {
-	if (!anyMemChecks_)
+	if (!anyMemChecks_ || SkipReportAt(pc))
 		return BREAK_ACTION_NONE;
 	MemCheck *check = FindMemCheckInRange(address, size);
 	if (check) {
@@ -578,7 +594,11 @@ BreakAction BreakpointManager::ExecMemCheck(u32 address, bool write, int size, u
 			return applyAction;
 
 		MemCheck copy = *check;
-		return copy.Action(address, write, size, pc, reason);
+		const BreakAction result = copy.Action(address, write, size, pc, reason, SkipPauseAt(pc));
+		if (result & BREAK_ACTION_PAUSE) {
+			NoteStoppedOnReport(pc);
+		}
+		return result;
 	}
 	return BREAK_ACTION_NONE;
 }
@@ -586,6 +606,11 @@ BreakAction BreakpointManager::ExecMemCheck(u32 address, bool write, int size, u
 BreakAction BreakpointManager::ExecOpMemCheck(u32 address, u32 pc) {
 	// Note: currently, we don't check "on changed" for HLE (ExecMemCheck.)
 	// We'd need to more carefully specify memory changes in HLE for that.
+	// pc may be the delay slot, but the skip is keyed on where execution resumes, which is the branch.
+	const u32 execPc = currentMIPS->pc;
+	if (SkipReportAt(execPc)) {
+		return BREAK_ACTION_NONE;
+	}
 	int size = MIPSAnalyst::OpMemoryAccessSize(pc);
 	if (size == 0 && MIPSAnalyst::OpHasDelaySlot(pc)) {
 		// This means that the delay slot is what tripped us.
@@ -611,7 +636,11 @@ BreakAction BreakpointManager::ExecOpMemCheck(u32 address, u32 pc) {
 				return applyAction;
 
 			MemCheck copy = *check;
-			return copy.Action(address, write, size, pc, "CPU");
+			const BreakAction result = copy.Action(address, write, size, pc, "CPU", SkipPauseAt(execPc));
+			if (result & BREAK_ACTION_PAUSE) {
+				NoteStoppedOnReport(execPc);
+			}
+			return result;
 		}
 	}
 	return BREAK_ACTION_NONE;
@@ -744,23 +773,28 @@ BreakAction BreakpointManager::ExecRegBreakpoint(int reg, u32 pc) {
 	if (info.hasCond && !info.cond.Evaluate())
 		return BREAK_ACTION_NONE;
 
+	if (SkipReportAt(pc)) {
+		return BREAK_ACTION_NONE;
+	}
+	const BreakAction result = SkipPauseAt(pc) ? BreakAction(info.result & ~BREAK_ACTION_PAUSE) : info.result;
+
 	++info.numHits;
 
 	BreakpointHit hit;
-	if (WebSocketDebuggerHasClients() || (info.result & BREAK_ACTION_PAUSE)) {
+	if (WebSocketDebuggerHasClients() || (result & BREAK_ACTION_PAUSE)) {
 		hit.kind = BreakpointKind::Register;
 		hit.pc = pc;
 		hit.address = pc;
 		hit.reg = reg;
 		hit.numHits = info.numHits;
-		hit.logged = (info.result & BREAK_ACTION_LOG) != 0;
-		hit.paused = (info.result & BREAK_ACTION_PAUSE) != 0;
+		hit.logged = (result & BREAK_ACTION_LOG) != 0;
+		hit.paused = (result & BREAK_ACTION_PAUSE) != 0;
 		if (info.hasCond)
 			hit.condition = info.cond.expressionString;
 		WebSocketNotifyBreakpointHit(hit);
 	}
 
-	if (info.result & BREAK_ACTION_LOG) {
+	if (result & BREAK_ACTION_LOG) {
 		if (info.logFormat.empty()) {
 			NOTICE_LOG(Log::JIT, "BKP reg write r%d, PC=%08x (%s)", reg, pc, g_symbolMap->GetDescription(pc).c_str());
 		} else {
@@ -769,28 +803,47 @@ BreakAction BreakpointManager::ExecRegBreakpoint(int reg, u32 pc) {
 			NOTICE_LOG(Log::JIT, "BKP reg write r%d, PC=%08x: %s", reg, pc, formatted.c_str());
 		}
 	}
-	if ((info.result & BREAK_ACTION_PAUSE) && g_breakpoints.CheckSkipFirst() != pc) {
+	if (result & BREAK_ACTION_PAUSE) {
 		Core_Break(BreakReason::RegBreakpoint, pc, &hit);
+		NoteStoppedOnReport(pc);
 	}
 
-	return info.result;
+	return result;
 }
 
 void BreakpointManager::ClearSkipFirst() {
-	breakSkipFirstAt_ = 0;
-	breakSkipFirstTicks_ = 0;
+	skipFirstValid_ = false;
+	stoppedOnReport_ = false;
 }
 
 void BreakpointManager::SetSkipFirst(u32 pc) {
-	breakSkipFirstAt_ = pc;
-	breakSkipFirstTicks_ = CoreTiming::GetTicks(currentMIPS);
+	const u64 ticks = CoreTiming::GetTicks(currentMIPS);
+	// A step-over arms its temporary breakpoint and then resumes, which comes through here again.
+	if (skipFirstValid_ && skipFirstAt_ == pc && skipFirstTicks_ == ticks) {
+		return;
+	}
+	skipFirstValid_ = true;
+	skipFirstAt_ = pc;
+	skipFirstTicks_ = ticks;
+	// Consumed here, since a plain step stops again without going through Core_Break().
+	skipFirstReport_ = stoppedOnReport_ && stoppedOnReportAt_ == pc;
+	if (skipFirstReport_) {
+		stoppedOnReport_ = false;
+	}
 }
 
-u32 BreakpointManager::CheckSkipFirst() const {
-	u32 pc = breakSkipFirstAt_;
-	if (breakSkipFirstTicks_ == CoreTiming::GetTicks(currentMIPS))
-		return pc;
-	return 0;
+bool BreakpointManager::SkipPauseAt(u32 pc) const {
+	return skipFirstValid_ && skipFirstAt_ == pc && skipFirstTicks_ == CoreTiming::GetTicks(currentMIPS);
+}
+
+bool BreakpointManager::SkipReportAt(u32 pc) const {
+	return skipFirstReport_ && SkipPauseAt(pc);
+}
+
+// Call after Core_Break(), which clears it.
+void BreakpointManager::NoteStoppedOnReport(u32 pc) {
+	stoppedOnReport_ = true;
+	stoppedOnReportAt_ = pc;
 }
 
 static MemCheck NotCached(MemCheck mc) {

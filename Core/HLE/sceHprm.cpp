@@ -48,14 +48,24 @@ static u32 sceHprmUnregisterCallback() {
 	return hleLogError(Log::HLE, 0, "UNIMPL");
 }
 
+// The latch is 4 x u32 (make, break, press, release). We don't support the headphone remote
+// buttons, so it's all zeroes.
+static void WriteEmptyLatch(u32 latchAddr) {
+	if (!Memory::IsValid4AlignedRange(latchAddr, 16)) {
+		return;
+	}
+	for (int i = 0; i < 4; i++) {
+		Memory::WriteUnchecked_U32(0, latchAddr + i * 4);
+	}
+}
+
 static u32 sceHprmPeekLatch(u32 latchAddr) {
-	return hleLogDebug(Log::HLE,0, "latchAddr %08x", latchAddr);
+	WriteEmptyLatch(latchAddr);
+	return hleLogDebug(Log::HLE, 0, "latchAddr %08x", latchAddr);
 }
 
 static u32 sceHprmReadLatch(u32 latchAddr) {
-	// Real hardware/JPCSP: 4 x u32 output struct, dummied out to all-zero (nothing held/pressed).
-	for (int i = 0; i < 4; i++)
-		Memory::WriteOrException_U32(0, latchAddr + i * 4);
+	WriteEmptyLatch(latchAddr);
 	return hleLogDebug(Log::HLE, 0, "latchAddr %08x", latchAddr);
 }
 
@@ -91,6 +101,20 @@ const HLEFunction sceHprm_driver[] =
 	// Purpose unknown - JPCSP names it after its NID too, and returns 0. Present so the VSH's
 	// one startup call resolves instead of trapping.
 	{0XDC895B2B, &WrapU_V<sceHprm_driver_DC895B2B>, "sceHprm_driver_DC895B2B", 'x', ""},
+	// Older firmwares number these two differently. Same functions - matched by address against
+	// the same module's user-mode sceHprm exports (sceHprmReadLatch is sceHprm/0x40D2F9F0 in
+	// every build). The VSH calls ReadLatch once a frame, so without these an older firmware's
+	// XMB spends the whole boot trapping on an unresolved import.
+	// NOTE: new entries go at the end - the syscall opcode in a savestate is an index into this array.
+	{0XA3A87975, &WrapU_U<sceHprmReadLatch>, "sceHprmReadLatch", 'x', "x"},  // 6.31 - 6.39
+	{0X5FC5E53B, &WrapU_U<sceHprmReadLatch>, "sceHprmReadLatch", 'x', "x"},  // 6.00 - 6.20
+	{0X748FC3C8, &WrapU_V<sceHprm_driver_DC895B2B>, "sceHprm_driver_DC895B2B", 'x', ""},  // 6.31 - 6.39
+	{0X605DEA7A, &WrapU_U<sceHprmReadLatch>, "sceHprmReadLatch", 'x', "x"},  // 5.03 - 5.55
+	{0XA6E8D4F0, &WrapU_U<sceHprmReadLatch>, "sceHprmReadLatch", 'x', "x"},  // 3.95 - 4.05
+	{0X8C728076, &WrapU_U<sceHprmReadLatch>, "sceHprmReadLatch", 'x', "x"},  // 3.72 - 3.90
+	{0XF0AA1FB9, &WrapU_U<sceHprmReadLatch>, "sceHprmReadLatch", 'x', "x"},  // 3.71
+	// Same story as sceRtc_driver: 3.51 and older export it to kernel mode under the user-mode NID.
+	{0X40D2F9F0, &WrapU_U<sceHprmReadLatch>, "sceHprmReadLatch", 'x', "x"},  // 1.50 - 3.51
 };
 
 void Register_sceHprm_driver()

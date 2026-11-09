@@ -136,7 +136,7 @@ bool FramebufferManagerGLES::ReadbackStencilbuffer(Draw::Framebuffer *fbo, int x
 	draw_->BindSamplerStates(TEX_SLOT_PSP_TEXTURE, 1, &stencilReadbackSampler_);
 
 	// We must bind the program after starting the render pass.
-	draw_->SetScissorRect(0, 0, w, h);
+	draw_->SetScissorRect(x, y, w, h);
 	draw_->BindPipeline(stencilReadbackPipeline_);
 
 	// Fullscreen triangle coordinates.
@@ -147,9 +147,13 @@ bool FramebufferManagerGLES::ReadbackStencilbuffer(Draw::Framebuffer *fbo, int x
 	};
 	draw_->DrawUP(positions, 3);
 
-	draw_->CopyFramebufferToMemory(blitFBO, Aspect::COLOR_BIT, x, y, w, h, DataFormat::R8G8B8A8_UNORM, convBuf_, w, mode, "ReadbackStencilbufferSync");
+	const bool copied = draw_->CopyFramebufferToMemory(blitFBO, Aspect::COLOR_BIT, x, y, w, h, DataFormat::R8G8B8A8_UNORM, convBuf_, w, mode, "ReadbackStencilbufferSync");
 
 	textureCache_->ForgetLastTexture();
+	if (!copied) {
+		gstate_c.Dirty(DIRTY_ALL_RENDER_STATE);
+		return false;
+	}
 
 	// TODO: Use 1/4 width to write all values directly and skip CPU conversion?
 	uint8_t *dest = pixels;

@@ -4,6 +4,9 @@
 #include "Common/GPU/thin3d.h"
 #include "Common/Thread/ThreadUtil.h"
 #include "Common/VR/PPSSPPVR.h"
+#ifdef __LIBRETRO__
+#include "libretro/LibretroVR.h"
+#endif
 
 #include "Common/Log.h"
 #include "Common/TimeUtil.h"
@@ -41,7 +44,7 @@ GLRenderManager::~GLRenderManager() {
 		_assert_(frameData_[i].deleter_prev.IsEmpty());
 	}
 	// Was anything deleted during shutdown?
-	deleter_.Perform(this, skipGLCalls_);
+	deleter_.Perform(this);
 	_assert_(deleter_.IsEmpty());
 }
 
@@ -52,7 +55,6 @@ void GLRenderManager::ThreadStart(Draw::DrawContext *draw) {
 
 	exitNotified_ = false;
 	hitExit_ = false;
-	skipGLCalls_ = false;
 
 	if (newInflightFrames_ != -1) {
 		INFO_LOG(Log::G3D, "OpenGL: Updating inflight frames to %d", newInflightFrames_);
@@ -103,18 +105,17 @@ void GLRenderManager::ThreadEnd() {
 
 	VLOG("  PULL: Quitting");
 
-	// Good time to run all the deleters to get rid of leftover objects.
+	// Good time to run all the deleters to get rid of leftover objects. The context is still current.
 	for (int i = 0; i < MAX_INFLIGHT_FRAMES; i++) {
-		// Since we're in shutdown, we should skip the GL calls on Android.
-		frameData_[i].deleter.Perform(this, skipGLCalls_);
-		frameData_[i].deleter_prev.Perform(this, skipGLCalls_);
+		frameData_[i].deleter.Perform(this);
+		frameData_[i].deleter_prev.Perform(this);
 	}
-	deleter_.Perform(this, skipGLCalls_);
-	for (int i = 0; i < (int)steps_.size(); i++) {
-		delete steps_[i];
-	}
-	steps_.clear();
+	deleter_.Perform(this);
+	// Steps that never got submitted. A dry run frees the data they own (texture uploads etc), and the steps.
+	queueRunner_.RunInitSteps(initSteps_, true);
 	initSteps_.clear();
+	queueRunner_.RunSteps(steps_, frameData_[0], true, false, false);
+	steps_.clear();
 	INFO_LOG(Log::G3D, "GLRenderManager::ThreadEnd end");
 }
 
@@ -302,20 +303,7 @@ bool GLRenderManager::CopyFramebufferToMemory(GLRFramebuffer *src, int aspectBit
 	curRenderStep_ = nullptr;
 	FlushSync();
 
-	Draw::DataFormat srcFormat;
-	if (aspectBits & GL_COLOR_BUFFER_BIT) {
-		srcFormat = Draw::DataFormat::R8G8B8A8_UNORM;
-	} else if (aspectBits & GL_STENCIL_BUFFER_BIT) {
-		// Copies from stencil are always S8.
-		srcFormat = Draw::DataFormat::S8;
-	} else if (aspectBits & GL_DEPTH_BUFFER_BIT) {
-		// TODO: Do this properly.
-		srcFormat = Draw::DataFormat::D24_S8;
-	} else {
-		return false;
-	}
-	queueRunner_.CopyFromReadbackBuffer(src, w, h, srcFormat, destFormat, pixelStride, pixels);
-	return true;
+	return queueRunner_.CopyFromReadbackBuffer(src, w, h, destFormat, pixelStride, pixels);
 }
 
 void GLRenderManager::CopyImageToMemorySync(GLRTexture *texture, int mipLevel, int x, int y, int w, int h, Draw::DataFormat destFormat, uint8_t *pixels, int pixelStride, const char *tag) {
@@ -331,7 +319,7 @@ void GLRenderManager::CopyImageToMemorySync(GLRTexture *texture, int mipLevel, i
 	curRenderStep_ = nullptr;
 	FlushSync();
 
-	queueRunner_.CopyFromReadbackBuffer(nullptr, w, h, Draw::DataFormat::R8G8B8A8_UNORM, destFormat, pixelStride, pixels);
+	queueRunner_.CopyFromReadbackBuffer(nullptr, w, h, destFormat, pixelStride, pixels);
 }
 
 void GLRenderManager::BeginFrame(bool enableProfiling) {
@@ -397,10 +385,13 @@ void GLRenderManager::Finish() {
 	task->frame = curFrame;
 	{
 		std::unique_lock<std::mutex> lock(pushMutex_);
-		task->initSteps = std::move(initSteps_);
+		{
+			std::lock_guard<std::mutex> initLock(initStepsMutex_);
+			task->initSteps = std::move(initSteps_);
+			initSteps_.clear();
+		}
 		task->steps = std::move(steps_);
 		renderThreadQueue_.push(task);
-		initSteps_.clear();
 		steps_.clear();
 		pushCondVar_.notify_one();
 	}
@@ -465,15 +456,16 @@ bool GLRenderManager::Run(GLRRenderThreadTask &task) {
 	if (!frameData.hasBegun) {
 		frameData.hasBegun = true;
 
-		frameData.deleter_prev.Perform(this, skipGLCalls_);
+		frameData.deleter_prev.Perform(this);
 		frameData.deleter_prev.Take(frameData.deleter);
 	}
 
 	// queueRunner_.LogSteps(stepsOnThread);
-	queueRunner_.RunInitSteps(task.initSteps, skipGLCalls_);
+	queueRunner_.RunInitSteps(task.initSteps, false);
 
 	// Run this after RunInitSteps so any fresh GLRBuffers for the pushbuffers can get created.
-	if (!skipGLCalls_) {
+	{
+		std::lock_guard<std::mutex> lock(pushBuffersMutex_);
 		for (auto iter : frameData.activePushBuffers) {
 			iter->Flush();
 			iter->UnmapDevice();
@@ -484,22 +476,32 @@ bool GLRenderManager::Run(GLRRenderThreadTask &task) {
 		frameData.profile.cpuStartTime = time_now_d();
 	}
 
+#ifdef __LIBRETRO__
+	if (Libretro::VRActive()) {
+		for (int eye = 0; eye < 2; ++eye) {
+			Libretro::BeginVREye(eye);
+			queueRunner_.RunSteps(task.steps, frameData, false, eye == 0, false);
+		}
+		Libretro::EndVREyes();
+	} else
+#endif
 	if (IsVREnabled()) {
 		int passes = GetVRPassesCount();
 		for (int i = 0; i < passes; i++) {
 			PreVRFrameRender(i);
-			queueRunner_.RunSteps(task.steps, frameData, skipGLCalls_, i < passes - 1, true);
+			queueRunner_.RunSteps(task.steps, frameData, false, i < passes - 1, true);
 			PostVRFrameRender();
 		}
 	} else {
-		queueRunner_.RunSteps(task.steps, frameData, skipGLCalls_, false, false);
+		queueRunner_.RunSteps(task.steps, frameData, false, false, false);
 	}
 
 	if (frameData.profile.enabled) {
 		frameData.profile.cpuEndTime = time_now_d();
 	}
 
-	if (!skipGLCalls_) {
+	{
+		std::lock_guard<std::mutex> lock(pushBuffersMutex_);
 		for (auto iter : frameData.activePushBuffers) {
 			iter->MapDevice(bufferStrategy_);
 		}
@@ -537,7 +539,11 @@ void GLRenderManager::FlushSync() {
 
 		std::unique_lock<std::mutex> lock(pushMutex_);
 		renderThreadQueue_.push(task);
-		renderThreadQueue_.back()->initSteps = std::move(initSteps_);
+		{
+			std::lock_guard<std::mutex> initLock(initStepsMutex_);
+			renderThreadQueue_.back()->initSteps = std::move(initSteps_);
+			initSteps_.clear();
+		}
 		renderThreadQueue_.back()->steps = std::move(steps_);
 		pushCondVar_.notify_one();
 		steps_.clear();

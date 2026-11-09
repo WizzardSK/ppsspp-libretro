@@ -60,16 +60,12 @@
 //
 // BUGS
 //
-// Custom music plays but starts stuttering:
-// * Beats
-//
 // Custom music just repeats a small section:
 // * Crazy Taxi
 
 #include <map>
 #include <algorithm>
 
-#include "Core/Config.h"
 #include "Core/Debugger/MemBlockInfo.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/ErrorCodes.h"
@@ -161,12 +157,22 @@ void __Mp3Shutdown() {
 
 void __Mp3DoState(PointerWrap &p) {
 	auto s = p.Section("sceMp3", 0, 3);
-	if (!s)
+	if (!s) {
+		if (p.mode == PointerWrap::MODE_READ) {
+			__Mp3Shutdown();
+			resourceInited = false;
+		}
 		return;
+	}
 
 	if (s >= 2) {
 		Do(p, g_mp3Map);
 	} else {
+		for (auto &[_, mp3] : g_mp3Map) {
+			delete mp3;
+		}
+		g_mp3Map.clear();
+
 		std::map<u32, Mp3ContextOld *> mp3Map_old;
 		Do(p, mp3Map_old); // read old map
 		for (auto it = mp3Map_old.begin(), end = mp3Map_old.end(); it != end; ++it) {
@@ -191,6 +197,7 @@ void __Mp3DoState(PointerWrap &p) {
 
 			mp3->decoder = CreateAudioDecoder(PSP_CODEC_MP3);
 			g_mp3Map[id] = mp3;
+			delete mp3_old;
 		}
 	}
 
@@ -297,7 +304,13 @@ static u32 sceMp3ReserveMp3Handle(u32 mp3Addr) {
 	Au->SetReadPos(Au->startPos);
 	Au->decoder = CreateAudioDecoder(PSP_CODEC_MP3);
 
-	int handle = (int)g_mp3Map.size();
+	// Take the lowest free handle. Using the map size instead would hand back a handle that's
+	// already in use if a lower one was released first - releasing 0 while 1 is still open made
+	// the next reserve return 1 again, leaking that context and playing over the game's stream.
+	int handle = 0;
+	while (g_mp3Map.find(handle) != g_mp3Map.end()) {
+		handle++;
+	}
 	g_mp3Map[handle] = Au;
 
 	return hleLogDebug(Log::ME, handle);
@@ -407,9 +420,10 @@ static int CalculateMp3SamplesPerFrame(int versionBits, int layerBits) {
 
 static int FindMp3Header(AuCtx *ctx, int &header, int end) {
 	u32 addr = ctx->AuBuf + ctx->AuStreamWorkareaSize();
-	if (Memory::IsValidRange(addr, end)) {
+	// A header is four bytes, read at each offset.
+	if (end >= 4 && Memory::IsValidRange(addr, end)) {
 		const u8 *ptr = Memory::GetPointerUnchecked(addr);
-		for (int offset = 0; offset < end; ++offset) {
+		for (int offset = 0; offset + 4 <= end; ++offset) {
 			// If we hit valid sync bits, then we've found a header.
 			if (ptr[offset] == 0xFF && (ptr[offset + 1] & 0xC0) == 0xC0) {
 				header = bswap32(Memory::ReadUnchecked_U32(addr + offset));
@@ -477,7 +491,24 @@ static int sceMp3Init(u32 mp3) {
 		// TODO: Should return 0x80671301 (unsupported version?)
 		WARN_LOG_REPORT(Log::ME, "sceMp3Init: invalid data: not MPEG v1");
 	}
-	if (samplerate != 44100 && sdkver < 3090500) {
+	// DELIBERATELY MORE LENIENT THAN A PSP.
+	//
+	// libmp3.prx only accepts a rate other than 44.1kHz from a game built with SDK 3.09.05 or
+	// later - it compares the compiled SDK version against 0x030904FF - and audio/mp3/init carries
+	// the hardware's answers for the rest: 48kHz and 32kHz both come back as 0x80671302.
+	//
+	// We only give that answer to something that declares no SDK version at all, which in practice
+	// means the test. Anything that declares one gets its rate accepted whatever it is. That is
+	// what PPSSPP has always done here, by accident - the threshold was written as decimal 3090500
+	// rather than 0x03090500, so every real version cleared it - but it is worth keeping on
+	// purpose. Beats and games like it build levels out of MP3s the user supplies, and refusing an
+	// ordinary 48kHz file looks like a bug to whoever supplied it.
+	//
+	// Note this only applies here. Under DisableHLE for sceMp3 the check is inside libmp3.prx and
+	// it does refuse the file, because the only thing we hand it is the sample rate index - which
+	// it also uses to look up the rate it plays at, so claiming 44.1kHz to get past the check would
+	// play the stream at the wrong speed. To be strict again, compare against 0x030904FF.
+	if (samplerate != 44100 && sdkver == 0) {
 		return hleDelayResult(hleLogError(Log::ME, SCE_MP3_ERROR_BAD_SAMPLE_RATE, "invalid data: not 44.1kHz"), "mp3 init", PARSE_DELAY_MS);
 	}
 
@@ -728,15 +759,31 @@ static u32 sceMp3LowLevelDecode(u32 mp3, u32 sourceAddr, u32 sourceBytesConsumed
 		return hleLogError(Log::ME, -1, "invalid address in args");
 	}
 
+	if (!Memory::IsValidRange(sourceBytesConsumedAddr, 4) || !Memory::IsValidRange(sampleBytesAddr, 4)) {
+		return hleLogError(Log::ME, -1, "invalid address in args");
+	}
 	const u8 *inbuff = Memory::GetPointerWriteUnchecked(sourceAddr);
 	int16_t *outbuf = (int16_t *)Memory::GetPointerWriteUnchecked(samplesAddr);
-	
+	// The decoder is handed up to 4096 bytes.
+	const int inBytes = (int)Memory::ClampValidSizeAt(sourceAddr, 4096);
+
+	// A frame is at most 1152 stereo samples, but an MPEG-2 or 2.5 one is 576. When the game's buffer
+	// can't take the biggest, decode aside and copy only what this frame made.
+	constexpr u32 maxFrameBytes = 1152 * 2 * 2;
+	const u32 outRoom = Memory::ClampValidSizeAt(samplesAddr, maxFrameBytes);
+	int16_t aside[1152 * 2];
 	int outSamples = 0;
 	int inbytesConsumed = 0;
-	if (!ctx->decoder->Decode(inbuff, 4096, &inbytesConsumed, 2, outbuf, &outSamples)) {
+	if (!ctx->decoder->Decode(inbuff, inBytes, &inbytesConsumed, 2, outRoom == maxFrameBytes ? outbuf : aside, &outSamples)) {
 		WARN_LOG(Log::ME, "sceMp3LowLevelDecode: Decode failed");
 	}
 	int outBytes = outSamples * sizeof(int16_t) * 2;
+	if (outRoom != maxFrameBytes) {
+		if ((u32)outBytes > outRoom) {
+			return hleLogError(Log::ME, -1, "output buffer too small for the frame");
+		}
+		memcpy(outbuf, aside, outBytes);
+	}
 	NotifyMemInfo(MemBlockFlags::WRITE, samplesAddr, outBytes, "Mp3LowLevelDecode");
 	
 	Memory::WriteOrException_U32(inbytesConsumed, sourceBytesConsumedAddr);

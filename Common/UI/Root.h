@@ -10,6 +10,7 @@ namespace UI {
 
 struct Margins;
 enum class FocusFlags;
+enum class FocusMove;
 
 // The ONLY global is the currently focused item.
 // Can be and often is null.
@@ -17,6 +18,9 @@ void EnableFocusMovement(bool enable);
 bool IsFocusMovementEnabled();
 View *GetFocusedView();
 void SetFocusedView(View *view, FocusFlags cause, bool force = false);
+// Scrolls the focused view into sight at the start of the next update, once it's been laid out.
+// For focusing a view that was just created, since SetFocus doesn't scroll by itself.
+void ScrollFocusedViewIntoView();
 void RemoveQueuedEventsByEvent(Event *e);
 void RemoveQueuedEventsByView(View * v);
 
@@ -25,7 +29,13 @@ DialogResult DispatchEvents();
 
 class ViewGroup;
 
+// Where Tab (FocusMove::NEXT) and Shift+Tab (FocusMove::PREV) move the focus to, wrapping around
+// at the ends. See ViewGroup::CollectTabOrder for what counts as a stop and in what order.
+// nullptr if there's nothing focusable at all. Exposed mainly so it can be tested directly.
+View *FindTabOrderNeighbor(ViewGroup *root, View *focusedView, FocusMove direction);
+
 void LayoutViewHierarchy(const UIContext &dc, const UI::Margins &rootMargins, UI::ViewGroup *root, ViewLayoutMode layoutMode, bool immersiveMode);
+void LayoutViewHierarchy(const UIContext &dc, const Bounds &rootBounds, UI::ViewGroup *root);
 DialogResult UpdateViewHierarchy(ViewGroup *root, bool canEnableFocusMovement = true);
 
 enum class KeyEventResult {
@@ -52,6 +62,11 @@ enum class UISound {
 };
 
 void SetSoundCallback(std::function<void(UISound)> func);
+
+// Called when the user tries to activate a disabled view (tapping it, or pressing accept
+// while it's focused), so the app can say why it's disabled.
+void SetDisabledActivationCallback(std::function<void(View *)> func);
+void NotifyDisabledActivation(View *view);
 
 // This is only meant for actual UI navigation sound, not achievements.
 // Call directly into the player for other UI effects.

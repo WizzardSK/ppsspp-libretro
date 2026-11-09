@@ -136,6 +136,11 @@ void PGF::DoState(PointerWrap &p) {
 	fontDataSize = (size_t)fontDataSizeTemp;
 	if (p.mode == p.MODE_READ) {
 		delete [] fontData;
+		fontData = nullptr;
+		if (!p.CheckRead(fontDataSize)) {
+			fontDataSize = 0;
+			return;
+		}
 		if (fontDataSize) {
 			fontData = new u8[fontDataSize];
 			DoArray(p, fontData, (int)fontDataSize);
@@ -196,6 +201,26 @@ bool PGF::ReadPtr(const u8 *ptr, size_t dataSize) {
 		ptr += sizeof(rev3extra);
 	}
 
+	// Also cap the lengths so a crafted font can't force absurd allocations
+	// or loops downstream. Real PGF fonts are tiny.
+	if (header.charPointerLength < 0 || header.charPointerLength > 0x100000 ||
+		header.charMapLength < 0 || header.charMapLength > 0x100000 ||
+		header.shadowMapLength < 0 || header.shadowMapLength > 0x10000) {
+		return false;
+	}
+
+	// BPE fields are signed in the on-disk header, but getBits() only accepts
+	// positive widths up to one machine word. Validate them before converting
+	// them to unsigned values for the table-size calculations below.
+	if (header.charMapBpe < 0 || header.charMapBpe > 32 ||
+		header.charPointerBpe < 0 || header.charPointerBpe > 32 ||
+		header.shadowMapBpe < 0 || header.shadowMapBpe > 32 ||
+		(header.charMapLength > 0 && header.charMapBpe == 0) ||
+		(header.charPointerLength > 0 && header.charPointerBpe == 0) ||
+		(header.shadowMapLength > 0 && header.shadowMapBpe == 0)) {
+		return false;
+	}
+
 	// Validate that all tables fit in the input buffer before reading any of
 	// them. Use 64-bit arithmetic: the original 32-bit signed size math could
 	// overflow for crafted lengths.
@@ -205,14 +230,6 @@ bool PGF::ReadPtr(const u8 *ptr, size_t dataSize) {
 	const u64 compTableSize = header.revision == 3 ? ((u64)rev3extra.compCharMapLength1 + rev3extra.compCharMapLength2) * 4 : 0;
 	const u64 charMapSize = (((u64)header.charMapLength * header.charMapBpe + 31) & ~31ull) / 8;
 	const u64 charPointerSize = (((u64)header.charPointerLength * header.charPointerBpe + 31) & ~31ull) / 8;
-
-	// Also cap the lengths so a crafted font can't force absurd allocations
-	// or loops downstream. Real PGF fonts are tiny.
-	if (header.charPointerLength < 0 || header.charPointerLength > 0x100000 ||
-		header.charMapLength < 0 || header.charMapLength > 0x100000 ||
-		header.shadowMapLength < 0 || header.shadowMapLength > 0x10000) {
-		return false;
-	}
 
 	if (headerSize + tablesSize + shadowCharMapSize + compTableSize + charMapSize + charPointerSize > dataSize) {
 		return false;
@@ -584,6 +601,23 @@ bool PGF::GetCharGlyph(int charCode, int glyphType, Glyph &glyph) const {
 	return true;
 }
 
+static const u8 fontPixelSizeInBytes[] = { 0, 0, 1, 3, 4 };  // 0 means 2 pixels per byte
+
+// How far into the glyph buffer a draw can reach. Usually bytesPerLine covers a whole row and this
+// is just bytesPerLine * bufHeight, but nothing makes a game set it that way - with a smaller
+// bytesPerLine the rows overlap and the last one runs past that, so the cache invalidation has to
+// cover the wider of the two.
+static u32 GlyphBufferExtent(const GlyphImage *image) {
+	const u32 rows = (u32)image->bytesPerLine * image->bufHeight;
+	if (image->pixelFormat < 0 || image->pixelFormat > PSP_FONT_PIXELFORMAT_32 || image->bufHeight == 0) {
+		return rows;
+	}
+	const int pixelBytes = fontPixelSizeInBytes[image->pixelFormat];
+	const u32 rowBytes = pixelBytes == 0 ? ((u32)image->bufWidth + 1) / 2 : (u32)image->bufWidth * pixelBytes;
+	const u32 lastRow = (u32)(image->bufHeight - 1) * image->bytesPerLine + rowBytes;
+	return std::max(rows, lastRow);
+}
+
 void PGF::DrawCharacter(const GlyphImage *image, int clipX, int clipY, int clipWidth, int clipHeight, int charCode, int altCharCode, int glyphType) const {
 	Glyph glyph;
 	if (!GetCharGlyph(charCode, glyphType, glyph)) {
@@ -605,7 +639,7 @@ void PGF::DrawCharacter(const GlyphImage *image, int clipX, int clipY, int clipW
 
 	if (((glyph.flags & FONT_PGF_BMP_OVERLAY) != FONT_PGF_BMP_H_ROWS) &&
 		((glyph.flags & FONT_PGF_BMP_OVERLAY) != FONT_PGF_BMP_V_ROWS)) {
-		ERROR_LOG_REPORT(Log::sceFont, "Nonsense glyph bitmap direction flag");
+		ERROR_LOG(Log::sceFont, "Nonsense glyph bitmap direction flag");
 		return;
 	}
 
@@ -616,7 +650,7 @@ void PGF::DrawCharacter(const GlyphImage *image, int clipX, int clipY, int clipW
 	//
 	// This was measured on a PSP-1000: 32 cases per format, every pixel left at its pre-fill value.
 	if (pixelFormat != PSP_FONT_PIXELFORMAT_4 && pixelFormat != PSP_FONT_PIXELFORMAT_8) {
-		WARN_LOG_REPORT_ONCE(pgfunsupportedfmt, Log::sceFont, "Font pixel format %d draws nothing on hardware", (int)pixelFormat);
+		WARN_LOG_ONCE(pgfunsupportedfmt, Log::sceFont, "Font pixel format %d draws nothing on hardware", (int)pixelFormat);
 		return;
 	}
 
@@ -722,7 +756,7 @@ void PGF::DrawCharacter(const GlyphImage *image, int clipX, int clipY, int clipW
 		}
 	}
 
-	gpu->InvalidateCache(image->bufferPtr, image->bytesPerLine * image->bufHeight, GPU_INVALIDATE_SAFE);
+	gpu->InvalidateCache(image->bufferPtr, GlyphBufferExtent(image), GPU_INVALIDATE_SAFE);
 }
 
 // pixelColor arrives already scaled to `pixelformat`'s range, and is *added* to what is in the buffer with saturation; it does not replace it.
@@ -734,19 +768,18 @@ void PGF::SetFontPixel(u32 base, int bpl, int bufWidth, int bufHeight, int x, in
 		return;
 	}
 
-	static const u8 fontPixelSizeInBytes[] = { 0, 0, 1, 3, 4 }; // 0 means 2 pixels per byte
 	if (pixelformat < 0 || pixelformat > PSP_FONT_PIXELFORMAT_32) {
 		ERROR_LOG_REPORT_ONCE(pfgbadformat, Log::sceFont, "Invalid image format in image: %d", (int)pixelformat);
 		return;
 	}
-	int pixelBytes = fontPixelSizeInBytes[pixelformat];
-	int bufMaxWidth = (pixelBytes == 0 ? bpl * 2 : bpl / pixelBytes);
-	if (x >= bufMaxWidth) {
-		return;
-	}
+	const int pixelBytes = fontPixelSizeInBytes[pixelformat];
 
+	// Deliberately no check that x fits within bytesPerLine. The hardware just works out an
+	// address and writes, so with a bytesPerLine smaller than the row needs, rows overlap and the
+	// glyph smears across them - see the "Linesize = 1" case in pspautotests font/charglyphimage.
+	// The bufWidth/bufHeight rectangle above and the address check below are what keep this sane.
 	int framebufferAddr = base + (y * bpl) + (pixelBytes == 0 ? x / 2 : x * pixelBytes);
-	if (!Memory::IsValidAddress(framebufferAddr)) {
+	if (!Memory::IsValidRange(framebufferAddr, pixelBytes == 0 ? 1 : pixelBytes)) {
 		return;
 	}
 

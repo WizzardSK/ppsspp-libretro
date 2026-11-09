@@ -45,7 +45,7 @@ Make sure Python is available. On Windows the Microsoft Store alias may interfer
 ### Direct headless invocation
 
 ```
-Windows/x64/Debug/PPSSPPHeadless.exe --root pspautotests/tests/../ --compare --timeout=5 --graphics=software pspautotests/tests/audio/atrac/addstreamdata.prx
+Windows/x64/Debug/PPSSPPHeadless.exe --root pspautotests/tests/../ --compare --timeout-wall=5 --graphics=software pspautotests/tests/audio/atrac/addstreamdata.prx
 ```
 
 Instead of a single PRX, you can pass a directory (e.g. `pspautotests/tests/threads/mbx/...`) to run all tests under it, recursively.
@@ -53,8 +53,55 @@ Instead of a single PRX, you can pass a directory (e.g. `pspautotests/tests/thre
 **Key flags:**
 - `--root` — points to the directory above `tests/` so the headless can find the expected directory layout.
 - `--compare` — enables output comparison against `.expected` files.
-- `--timeout=N` — seconds per test before killing it (default 5).
+- `--timeout-wall=N` — real seconds per test before killing it (default 5). `--timeout-emulated=N` is the
+  same idea in emulated time, and both can be set at once. `--timeout` is the old name for `--timeout-wall`.
 - `--graphics=software` — uses software GPU backend (required for headless; no real GPU available).
+
+### Tests that need the real firmware modules
+
+A pspautotest is homebrew, so headless runs every library on our HLE for it
+(`iForceEnableHLE` in `headless/Headless.cpp`), even the ones the app runs from the firmware by
+default. Some tests only mean anything against the real module: `video/mp4/avchold` and
+`video/mpeg/decodeend` test the Media Engine through Sony's `libmp4.prx`, `mp4msv.prx` and
+`mpeg.prx`, which call our `sceVideocodec` HLE. Run on our HLE, `avchold` reports
+`0 samples, 0 decodes` for every stream (our sceMp4 is stubs: the log says `UNIMPL sceMp4Create`),
+and it fails without exercising the decoder at all.
+
+To run them as the hardware does, pass both:
+
+- `--disable-hle=N`, the `DisableHLEFlags` bits (`Core/ConfigValues.h`) of the libraries to run
+  for real, in decimal or `0x` hex. sceMpeg is 0x10 and sceMp4 is 0x100, so the video tests take
+  `--disable-hle=0x110`.
+- `--memstick=` pointing at a memory stick with a firmware dump in `PSP/NAND/flash0/kd`. `test.py`
+  otherwise hands headless the empty one beside the exe. Since the flag is explicit, headless exits
+  with an error naming the missing module rather than falling back to HLE.
+
+```
+python test.py video/mp4/avchold video/mpeg/decodeend --graphics=software --memstick=<app memstick> --disable-hle=0x110
+```
+
+CI has no firmware dump, so these tests stay in `tests_next`, and a change to the video path
+needs this run done by hand.
+
+### Multi-console ad hoc tests
+
+The tests in `tests/net/adhoc/pair` (one host program and one client program each, see
+[pspautotests-hardware.md](pspautotests-hardware.md#tests-that-need-two-psps)) need several emulators
+running at once. `test.py` hands them to `Tools/adhoc_multi.py`, which starts one PPSSPPHeadless per
+role with `--realtime` and `--instance=N` (its own 127.0.0.N address and MAC), the host with
+`--adhoc-server`, and compares each against its own `.expected`. Each test runs twice, once in each
+data mode: through the built-in server's relay (aemu_postoffice), and P2P, where the instances send to
+each other directly. A test that fails in only one mode goes in `pair_known_failures` for that mode.
+`--adhoc-mode=relay` or `--adhoc-mode=p2p` runs just one:
+
+```bash
+python3 test.py -g -m net/adhoc/pair --adhoc-mode=p2p
+python3 Tools/adhoc_multi.py [--relay] net/adhoc/pair/basic
+```
+
+In P2P mode instance N binds to 127.0.0.N. Linux and Windows route all of 127/8 to the loopback, but
+macOS needs the addresses added, after every reboot: `sudo ifconfig lo0 alias 127.0.0.2 up` (and .3, ...
+for tests with more clients). Without them the P2P run fails and prints that command.
 
 ### What you'll see
 
@@ -76,9 +123,43 @@ Failed tests:
   threads/mbx/refer/refer
 ```
 
-Lines prefixed with `O` are from the `.expected` file (real PSP), `E` is what PPSSPP produced, and `+` means a match.
+Lines prefixed with `O` are what PPSSPP produced (the Output), `E` is the corresponding line from
+the `.expected` file recorded on a real PSP, and `+` means a match.
 
-The diff is line-by-line, so an `O` line followed by an `E` line at the same conceptual position means PPSSPP produced different output at that spot. A `+` line means both outputs agreed on that line.
+The diff is line-by-line, so an `O` line followed by an `E` line at the same conceptual position
+means PPSSPP produced different output at that spot. A `+` line means both outputs agreed on that
+line.
+
+### The `[x]` and `[r]` markers - they're about scheduling
+
+Most tests print their lines through `checkpoint()` in `pspautotests/common/common.c`, which tags
+every line with `[x]` or `[r]`:
+
+```
+O [x] While open: OK (allocated 12)
+E [x] While open: OK (allocated 0)
+```
+
+The tag is not decoration. Each `checkpoint()` call starts a helper thread that does nothing but
+set a flag, then terminates and restarts it for the next one. If that thread got a chance to run
+before the next checkpoint, the line is tagged `[r]` - a **r**eschedule happened while the code
+under test ran. If it never got scheduled, the line is tagged `[x]`. (With `CHECKPOINT_ENABLE_TIME`
+the tag becomes `[x/1234]`, adding the microseconds since the previous checkpoint.)
+
+So the marker records **whether the syscall between the two checkpoints yielded to another
+thread**, which is a big part of what these tests are checking.
+
+That means a diff where only the marker differs, like
+
+```
+O [x]   GetCharInfo on open: 00000000
+E [r]   GetCharInfo on open: 00000000
+```
+
+is not a value bug at all - the return value matched. It says our implementation of that call
+doesn't reschedule where the real one does (or the other way round). Fixing it means changing
+whether the HLE function yields - `hleReSchedule`, `hleDelayResult` and friends - not what it
+returns. Don't go hunting for a wrong value; there isn't one.
 
 ## Workflow for fixing a test
 
@@ -104,7 +185,7 @@ The diff is line-by-line, so an `O` line followed by an `E` line at the same con
 - The diff output compares the full text output line-by-line. To see PPSSPP's raw output
   without the diff overlay, omit `--compare`:
   ```
-  Windows/x64/Debug/PPSSPPHeadless.exe --root pspautotests/tests/../ --timeout=5 --graphics=software path/to/test.prx
+  Windows/x64/Debug/PPSSPPHeadless.exe --root pspautotests/tests/../ --timeout-wall=5 --graphics=software path/to/test.prx
   ```
   There's another trick too, --print-equal-lines, which prints matching lines with a '=' prefix, so you can see the full output with context.
 - Tests can show contradictory expected outputs at first glance. For example, the mbx/send

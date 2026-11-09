@@ -75,27 +75,24 @@ enum AdhocSocketRequestType : int
 	ADHOC_POLL_SOCKET = 7,
 };
 
-// TODO: maybe move these to sceNetAdhocDiscover?
 typedef struct SceNetAdhocDiscoverParam {
-    u32_le unknown1; // SleepMode? (ie. 0 on on Legend Of The Dragon, 1 on Dissidia 012)
-    char   groupName[ADHOCCTL_GROUPNAME_LEN];
-    u32_le unknown2; // size of something? (ie. 0x3c on Legend Of The Dragon, 0x14 on Dissidia 012) // Note: the param size is 0x14 may be it can contains extra data too?
-    u32_le result; // inited to 0?
+	u32_le mode;  // 0 sleeps in the DISCOVER state until another console is near (Legend of the Dragon), 1 goes into the WOL state (Dissidia 012).
+	char groupName[ADHOCCTL_GROUPNAME_LEN];
+	u32_le timeoutSec;  // How long to look once awake (0x3c in Legend of the Dragon, 0x14 in Dissidia 012).
+	u32_le result;  // AdhocDiscoverResult or an adhocctl error, written when it finishes.
 } PACK SceNetAdhocDiscoverParam;
 
-enum AdhocDiscoverStatus : int
-{
+enum AdhocDiscoverStatus : int {
 	NET_ADHOC_DISCOVER_STATUS_NONE = 0,
 	NET_ADHOC_DISCOVER_STATUS_IN_PROGRESS = 1,
 	NET_ADHOC_DISCOVER_STATUS_COMPLETED = 2,
 };
 
-enum AdhocDiscoverResult : int
-{
-	NET_ADHOC_DISCOVER_RESULT_NO_PEER_FOUND = 0, // Initial value
-	NET_ADHOC_DISCOVER_RESULT_CANCELED = 1, // CANCELED or STOPPED?
-	NET_ADHOC_DISCOVER_RESULT_PEER_FOUND = 2,
-	NET_ADHOC_DISCOVER_RESULT_ABORTED = 3, // Internal Error occured?
+enum AdhocDiscoverResult : int {
+	NET_ADHOC_DISCOVER_RESULT_PEER_FOUND = 0,  // In the group with a peer (pspautotests net/adhoc/pair/discover).
+	NET_ADHOC_DISCOVER_RESULT_CANCELED = 1,  // After a Stop (pspautotests net/adhoc/discover).
+	NET_ADHOC_DISCOVER_RESULT_NO_PEER_FOUND = 2,  // The timeout passed.
+	NET_ADHOC_DISCOVER_RESULT_ABORTED = 3,
 };
 
 enum class AdhocDataMode {
@@ -142,6 +139,10 @@ void __NetAdhocDoState(PointerWrap &p);
 
 // TODO: expose it via "sceNetAdhocctl.h"
 void __UpdateAdhocctlHandlers(u32 flags, u32 error);
+// Drops queued events of one kind that haven't been delivered yet.
+void __DropAdhocctlEvents(u32 flags);
+// Leaves the server's group without an event, after entering game mode timed out.
+void NetAdhocctl_GameModeTimedOut();
 
 bool __NetAdhocConnected();
 
@@ -149,18 +150,21 @@ bool __NetAdhocConnected();
 // Called from netdialog (and from sceNetApctl)
 // NOTE: use hleCall for sceNet* ones!
 int sceNetAdhocctlGetState(u32 ptrToStatus);
-int sceNetAdhocctlCreate(const char * groupName);
-int sceNetAdhocctlConnect(const char* groupName);
-int sceNetAdhocctlJoin(u32 scanInfoAddr);
-int sceNetAdhocctlScan();
-int sceNetAdhocctlGetScanInfo(u32 sizeAddr, u32 bufAddr);
+int sceNetAdhocctlCreate(MIPSState *mips, const char * groupName);
+int sceNetAdhocctlConnect(MIPSState *mips, const char* groupName);
+int sceNetAdhocctlJoin(MIPSState *mips, u32 scanInfoAddr);
+int sceNetAdhocctlScan(MIPSState *mips);
+int sceNetAdhocctlGetScanInfo(MIPSState *mips, u32 sizeAddr, u32 bufAddr);
 int sceNetAdhocctlDisconnect();
-int sceNetAdhocctlInit(int stackSize, int prio, u32 productAddr);
+int sceNetAdhocctlInit(MIPSState *mips, int stackSize, int prio, u32 productAddr);
 int sceNetAdhocctlTerm();
 
 int NetAdhocctl_Term();
 int NetAdhocctl_GetState();
 int NetAdhocctl_Create(const char* groupName);
+int NetAdhocDiscover_GetStatus();
+void Register_sceNetAdhocctl_lib();
+void Register_sceNetIfhandle_lib();
 
 int NetAdhoc_Term();
 
@@ -169,13 +173,14 @@ extern bool netAdhocInited; // TODO: keep here
 extern bool netAdhocctlInited; // TODO: move to sceNetAdhocctl
 
 extern bool netAdhocGameModeEntered;
-extern s32 netAdhocDiscoverStatus; // TODO: maybe move to sceNetAdhocDiscover?
+extern bool netAdhocUseUdp;
 
 // Exposing those for the matching routines
 // NOTE: use hleCall for sceNet* ones!
-int sceNetAdhocPdpSend(int id, const char* mac, u32 port, void* data, int len, int timeout, int flag);
-int sceNetAdhocPdpRecv(int id, void* addr, void* port, void* buf, void* dataLength, u32 timeout, int flag);
-int sceNetAdhocPdpCreate(const char* mac, int port, int bufferSize, u32 flag);
+int sceNetAdhocPdpSend(MIPSState *mips, int id, const char* mac, u32 port, void* data, int len, int timeout, int flag);
+int sceNetAdhocPdpRecv(MIPSState *mips, int id, void* addr, void* port, void* buf, void* dataLength, u32 timeout, int flag);
+int sceNetAdhocPdpCreate(MIPSState *mips, const char* mac, int port, int bufferSize, u32 flag);
 
 int NetAdhoc_SetSocketAlert(int id, s32_le flag);
 int NetAdhocPdp_Delete(int id, int unknown);
+int NetAdhocPdpCreate(const char *mac, int port, int bufferSize, u32 flag, bool postoffice_enet_pdp_reliable);

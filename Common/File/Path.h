@@ -32,7 +32,7 @@
 enum class PathType {
 	UNDEFINED = 0,
 	NATIVE = 1,  // Can be relative.
-	CONTENT_URI = 2,  // Android only. Can only be absolute!
+	CONTENT_URI = 2,  // Android storage. Recognized everywhere, but only usable on Android. Can only be absolute!
 	HTTP = 3,  // http://, https://
 };
 
@@ -59,7 +59,15 @@ public:
 	}
 
 	bool Valid() const { return !path_.empty(); }
-	bool IsRoot() const { return path_ == "/"; }  // Special value - only path that can end in a slash.
+	bool IsRoot() const { return path_ == "/"; }  // Special value - only path that can end in a slash - except see below.
+	// On Windows, "//" is the network folder that lists the servers, the other path that ends in a slash.
+	bool IsNetworkRoot() const {
+#if PPSSPP_PLATFORM(WINDOWS)
+		return path_ == "//";
+#else
+		return false;
+#endif
+	}
 
 	// Some std::string emulation for simplicity.
 	bool empty() const { return !Valid(); }
@@ -86,7 +94,13 @@ public:
 
 	// File extension manipulation.
 	Path WithExtraExtension(std::string_view ext) const;
-	Path WithReplacedExtension(const std::string &oldExtension, const std::string &newExtension) const;
+	// Swaps one known extension for another, e.g. ".ppst" -> ".jpg". Returns false and leaves *out
+	// alone if the path doesn't actually end in oldExtension. That case has to be handled: this
+	// used to return the path unchanged, so a caller that guessed the extension wrong quietly
+	// carried on with the original file - and "delete the screenshot next to this savestate" then
+	// means "delete the savestate".
+	[[nodiscard]] bool WithReplacedExtension(const std::string &oldExtension, const std::string &newExtension, Path *out) const;
+	// Replaces whatever extension is there, so there's nothing to fail on.
 	Path WithReplacedExtension(const std::string &newExtension) const;
 
 	std::string GetFilename() const;  // Really, GetLastComponent. Could be a file or directory. Includes the extension.

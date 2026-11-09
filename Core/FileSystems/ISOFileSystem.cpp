@@ -233,7 +233,17 @@ std::string ISOFileSystem::TreeEntry::BuildPath() {
 }
 
 void ISOFileSystem::ReadDirectory(TreeEntry *root) const {
-	for (u32 secnum = root->startsector, endsector = root->startsector + (root->dirsize + 2047) / 2048; secnum < endsector; ++secnum) {
+	// Real directories are a few KB. The size comes from the image, so cap it to keep a corrupt
+	// one from making us parse (and allocate entries for) gigabytes of sectors.
+	const u32 MAX_DIRECTORY_SIZE = 4 * 1024 * 1024;
+	u32 dirsize = root->dirsize;
+	if (dirsize > MAX_DIRECTORY_SIZE) {
+		blockDevice->NotifyReadError();
+		ERROR_LOG(Log::FileSystem, "Directory '%s' claims an implausible size (%u), truncating", root->name.c_str(), dirsize);
+		dirsize = MAX_DIRECTORY_SIZE;
+	}
+	const u32 endsector = (u32)std::min<u64>((u64)root->startsector + (dirsize + 2047) / 2048, blockDevice->GetNumBlocks());
+	for (u32 secnum = root->startsector; secnum < endsector; ++secnum) {
 		u8 theSector[2048];
 		if (!blockDevice->ReadBlock(secnum, theSector)) {
 			blockDevice->NotifyReadError();
@@ -252,9 +262,10 @@ void ISOFileSystem::ReadDirectory(TreeEntry *root) const {
 				break;
 
 			const int IDENTIFIER_OFFSET = 33;
-			if (offset + IDENTIFIER_OFFSET + dir.identifierLength > 2048) {
+			if (offset + IDENTIFIER_OFFSET > 2048 || offset + IDENTIFIER_OFFSET + dir.identifierLength > 2048) {
 				blockDevice->NotifyReadError();
 				ERROR_LOG(Log::FileSystem, "Directory entry crosses sectors, corrupt iso?");
+				root->valid = true;  // Prevents re-reading (and duplicating the children so far)
 				return;
 			}
 			// dir.size (the record length actually consumed) must cover at least its
@@ -265,6 +276,7 @@ void ISOFileSystem::ReadDirectory(TreeEntry *root) const {
 			if (dir.size < IDENTIFIER_OFFSET + dir.identifierLength) {
 				blockDevice->NotifyReadError();
 				ERROR_LOG(Log::FileSystem, "Directory entry size too small, corrupt iso?");
+				root->valid = true;
 				return;
 			}
 
@@ -302,6 +314,25 @@ void ISOFileSystem::ReadDirectory(TreeEntry *root) const {
 				ERROR_LOG(Log::FileSystem, "File '%s' starts or ends outside ISO. firstDataSector: %d len: %d", entry->BuildPath().c_str(), (int)dir.firstDataSector, (int)dir.dataLength);
 			}
 
+			// The directory record is untrusted, and callers size host buffers from entry->size, so
+			// don't let it claim more data than the image actually contains. We clamp rather than
+			// drop the entry - truncated ISOs are common and used to work with just the warning
+			// above, and dropping EBOOT.BIN would turn that into an unbootable game. For a sane
+			// file this is a no-op, since the extent always fits in its sectors.
+			// Measured in bytes, not whole sectors: an image whose length isn't a multiple of the
+			// sector size still contains its final partial sector, and a file is allowed to end
+			// there. Counting blocks discards that tail, which clamped real files short - a dump
+			// with EBOOT.BIN running to the last byte of the image lost the end of it, and the ELF
+			// section headers that live there went with it.
+			if (isFile) {
+				const u64 imageBytes = blockDevice->GetUncompressedSize();
+				const u64 firstByte = (u64)dir.firstDataSector * (u64)sectorSize;
+				const s64 availableBytes = firstByte >= imageBytes ? 0 : (s64)(imageBytes - firstByte);
+				if (entry->size > availableBytes) {
+					entry->size = availableBytes;
+				}
+			}
+
 			if (entry->isDirectory && !relative) {
 				if (entry->startsector == root->startsector) {
 					blockDevice->NotifyReadError();
@@ -334,6 +365,11 @@ const ISOFileSystem::TreeEntry *ISOFileSystem::GetFromPath(std::string_view path
 
 	if (pathLength <= pathIndex)
 		return treeroot;
+
+	if (!treeroot) {
+		// The constructor gave up - no ISO9660 volume descriptor, or it wouldn't read.
+		return nullptr;
+	}
 
 	TreeEntry *entry = treeroot;
 	while (true) {
@@ -469,7 +505,7 @@ int ISOFileSystem::Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outd
 		}
 
 		if (!Memory::IsValidRange(outdataPtr, 0x800) || outlen < 0x800) {
-			WARN_LOG_REPORT(Log::FileSystem, "sceIoIoctl: Invalid out pointer %08x while reading ISO9660 volume descriptor", outdataPtr);
+			WARN_LOG(Log::FileSystem, "sceIoIoctl: Invalid out pointer %08x while reading ISO9660 volume descriptor", outdataPtr);
 			return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
 		}
 
@@ -485,7 +521,11 @@ int ISOFileSystem::Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outd
 		}
 
 		VolDescriptor desc;
-		blockDevice->ReadBlock(16, (u8 *)&desc);
+		if (!blockDevice->ReadBlock(16, (u8 *)&desc)) {
+			blockDevice->NotifyReadError();
+			ERROR_LOG(Log::FileSystem, "Failed to read volume descriptor for the path table");
+			return SCE_KERNEL_ERROR_ERRNO_IO_ERROR;
+		}
 		if (outlen < (u32)desc.pathTableLength) {
 			return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
 		} else {
@@ -494,7 +534,9 @@ int ISOFileSystem::Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outd
 			u8 *out = Memory::GetPointerWriteRangeOrException(outdataPtr, size);
 
 			int blocks = size / blockDevice->GetBlockSize();
-			blockDevice->ReadBlocks(block, blocks, out);
+			if (blocks > 0) {
+				blockDevice->ReadBlocks(block, blocks, out);
+			}
 			size -= blocks * blockDevice->GetBlockSize();
 			out += blocks * blockDevice->GetBlockSize();
 
@@ -503,7 +545,9 @@ int ISOFileSystem::Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outd
 				u8 temp[2048];
 				// `blocks` whole sectors starting at `block` were already consumed by
 				// ReadBlocks() above, so the trailing partial sector is the next one.
-				blockDevice->ReadBlock(block + blocks, temp);
+				if (!blockDevice->ReadBlock(block + blocks, temp)) {
+					memset(temp, 0, sizeof(temp));
+				}
 				memcpy(out, temp, size);
 			}
 			return 0;
@@ -602,7 +646,11 @@ size_t ISOFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) {
 
 		const u8 *const start = pointer;
 		if (firstBlockSize > 0) {
-			blockDevice->ReadBlock(secNum++, theSector);
+			// theSector is uninitialized stack memory, so on a failed read we must not copy it out -
+			// that would hand host stack contents to the game.
+			if (!blockDevice->ReadBlock(secNum++, theSector)) {
+				memset(theSector, 0, sizeof(theSector));
+			}
 			memcpy(pointer, theSector + firstBlockOffset, firstBlockSize);
 			pointer += firstBlockSize;
 		}
@@ -613,7 +661,9 @@ size_t ISOFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) {
 			pointer += middleSize;
 		}
 		if (lastBlockSize > 0) {
-			blockDevice->ReadBlock(secNum++, theSector);
+			if (!blockDevice->ReadBlock(secNum++, theSector)) {
+				memset(theSector, 0, sizeof(theSector));
+			}
 			memcpy(pointer, theSector, lastBlockSize);
 			pointer += lastBlockSize;
 		}
@@ -821,6 +871,12 @@ void ISOFileSystem::DoState(PointerWrap &p) {
 				std::string path;
 				Do(p, path);
 				of.file = GetFromPath(path);
+				if (!of.file) {
+					// Loaded against a different image. Like a file that's gone from a directory,
+					// drop the handle rather than keep one that points at nothing.
+					ERROR_LOG(Log::FileSystem, "Failed to reopen file while loading state: %s", path.c_str());
+					continue;
+				}
 			} else {
 				of.file = NULL;
 			}

@@ -15,6 +15,9 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
+#include <cstring>
+
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Common/Serialize/SerializeMap.h"
@@ -353,10 +356,14 @@ int MetaFileSystem::OpenFile(std::string filename, FileAccess access, const char
 	std::string of;
 	MountPoint *mount;
 	int error = MapFilePath(filename, &of, &mount);
-	if (error == 0)
-		return mount->system->OpenFile(of, access, mount->prefix.c_str());
-	else
+	if (error != 0) {
 		return error;
+	}
+	int handle = mount->system->OpenFile(of, access, mount->prefix.c_str());
+	if (handle < 0 && (mount->system->Flags() & FileSystemFlags::UMD)) {
+		failedDiscReads_++;
+	}
+	return handle;
 }
 
 PSPFileInfo MetaFileSystem::GetFileInfo(std::string filename)
@@ -507,6 +514,19 @@ int MetaFileSystem::RenameFile(const std::string &from, const std::string &to)
 	}
 }
 
+bool MetaFileSystem::SetFileWritable(const std::string &filename, bool writable)
+{
+	std::lock_guard<std::recursive_mutex> guard(lock);
+	std::string of;
+	IFileSystem *system;
+	int error = MapFilePath(filename, &of, &system);
+	if (error == 0) {
+		return system->SetFileWritable(of, writable);
+	} else {
+		return false;
+	}
+}
+
 bool MetaFileSystem::RemoveFile(const std::string &filename)
 {
 	std::lock_guard<std::recursive_mutex> guard(lock);
@@ -552,8 +572,8 @@ size_t MetaFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size)
 	IFileSystem *sys = GetHandleOwner(handle);
 	if (sys)
 		return sys->ReadFile(handle, pointer, size);
-	else
-		return 0;
+	failedDiscReads_++;
+	return 0;
 }
 
 size_t MetaFileSystem::WriteFile(u32 handle, const u8 *pointer, s64 size)
@@ -572,8 +592,8 @@ size_t MetaFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size, int &usec)
 	IFileSystem *sys = GetHandleOwner(handle);
 	if (sys)
 		return sys->ReadFile(handle, pointer, size, usec);
-	else
-		return 0;
+	failedDiscReads_++;
+	return 0;
 }
 
 size_t MetaFileSystem::WriteFile(u32 handle, const u8 *pointer, s64 size, int &usec)
@@ -592,11 +612,11 @@ size_t MetaFileSystem::SeekFile(u32 handle, s32 position, FileMove type)
 	IFileSystem *sys = GetHandleOwner(handle);
 	if (sys)
 		return sys->SeekFile(handle, position, type);
-	else
-		return 0;
+	failedDiscReads_++;
+	return 0;
 }
 
-int MetaFileSystem::ReadEntireFile(const std::string &filename, std::vector<u8> &data, bool quiet) {
+int MetaFileSystem::ReadEntireFile(const std::string &filename, std::vector<u8> &data, bool quiet, size_t maxSize) {
 	FileAccess access = FILEACCESS_READ;
 	if (quiet) {
 		access = (FileAccess)(access | FILEACCESS_PPSSPP_QUIET);
@@ -606,8 +626,14 @@ int MetaFileSystem::ReadEntireFile(const std::string &filename, std::vector<u8> 
 		return handle;
 
 	SeekFile(handle, 0, FILEMOVE_END);
-	size_t dataSize = GetSeekPos(handle);
+	// A failed seek is (size_t)-1, which an s64 only sees as negative on 64-bit.
+	const size_t fileSize = GetSeekPos(handle);
 	SeekFile(handle, 0, FILEMOVE_BEGIN);
+	if (fileSize == (size_t)-1 || fileSize > maxSize || fileSize > data.max_size()) {
+		CloseFile(handle);
+		return SCE_KERNEL_ERROR_ERROR;
+	}
+	const size_t dataSize = (size_t)fileSize;
 	data.resize(dataSize);
 
 	size_t result = ReadFile(handle, data.data(), dataSize);
@@ -633,7 +659,7 @@ u64 MetaFileSystem::FreeDiskSpace(const std::string &path) {
 void MetaFileSystem::DoState(PointerWrap &p) {
 	std::lock_guard<std::recursive_mutex> guard(lock);
 
-	auto s = p.Section("MetaFileSystem", 1);
+	auto s = p.Section("MetaFileSystem", 1, 2);
 	if (!s)
 		return;
 
@@ -642,22 +668,106 @@ void MetaFileSystem::DoState(PointerWrap &p) {
 	// Save/load per-thread current directory map
 	Do(p, currentDir);
 
-	u32 n = (u32) fileSystems.size();
-	Do(p, n);
-	bool skipPfat0 = false;
-	if (n != (u32) fileSystems.size()) {
-		if (n == (u32) fileSystems.size() - 1) {
-			skipPfat0 = true;
-		} else {
-			p.SetError(p.ERROR_FAILURE);
-			ERROR_LOG(Log::FileSystem, "Savestate failure: number of filesystems doesn't match.");
-			return;
-		}
+	if (s < 2) {
+		DoStatePositionalMounts(p);
+		return;
 	}
 
-	for (u32 i = 0; i < n; ++i) {
-		if (!skipPfat0 || fileSystems[i].prefix != "pfat0:") {
-			fileSystems[i].system->DoState(p);
+	// Each mount is stored as its prefix, the size of its filesystem's state, and that state. A load
+	// pairs them with our mounts by prefix, skips any we don't have, and leaves a mount the state
+	// doesn't have as it is. So mounts can be added, removed and reordered freely.
+	u32 n = (u32)fileSystems.size();
+	Do(p, n);
+
+	if (p.mode == PointerWrap::MODE_READ) {
+		for (u32 i = 0; i < n; i++) {
+			std::string prefix;
+			u32 size = 0;
+			Do(p, prefix);
+			Do(p, size);
+			if (p.Failed() || !p.CheckRead(size)) {
+				p.SetError(p.ERROR_FAILURE);
+				ERROR_LOG(Log::FileSystem, "Savestate failure: bad mount entry %d", (int)i);
+				return;
+			}
+			u8 *data = *p.ptr;
+			p.SkipBytes(size);
+
+			auto mount = std::find_if(fileSystems.begin(), fileSystems.end(), [&](const MountPoint &m) {
+				return m.prefix == prefix;
+			});
+			if (mount == fileSystems.end()) {
+				WARN_LOG(Log::FileSystem, "Savestate has a mount we don't have, skipping it: %s", prefix.c_str());
+				continue;
+			}
+
+			// Read through a PointerWrap of its own, so it can't read past its own data.
+			PointerWrap sub(&data, PointerWrap::MODE_READ);
+			sub.SetReadEnd(data + size);
+			mount->system->DoState(sub);
+			if (sub.Failed()) {
+				p.SetError(p.ERROR_FAILURE);
+				ERROR_LOG(Log::FileSystem, "Savestate failure: couldn't load mount %s (at section %s)", prefix.c_str(), sub.GetBadSectionTitle() ? sub.GetBadSectionTitle() : "unknown");
+				return;
+			}
+		}
+		return;
+	}
+
+	for (const MountPoint &mount : fileSystems) {
+		std::string prefix = mount.prefix;
+		Do(p, prefix);
+		// Filled in once the filesystem's state is written.
+		u8 *sizePtr = *p.ptr;
+		if (p.mode == PointerWrap::MODE_VERIFY) {
+			p.SkipBytes(sizeof(u32));
+		} else {
+			u32 size = 0;
+			Do(p, size);
+		}
+		const size_t start = p.Offset();
+		mount.system->DoState(p);
+		if (p.mode == PointerWrap::MODE_WRITE) {
+			const u32 size = (u32)(p.Offset() - start);
+			memcpy(sizePtr, &size, sizeof(size));
+		}
+	}
+}
+
+// Version 1 of the state: the mounts with no prefixes or sizes, one after another.
+void MetaFileSystem::DoStatePositionalMounts(PointerWrap &p) {
+	u32 n = (u32)fileSystems.size();
+	Do(p, n);
+
+	// The mounts are serialized positionally: one section per mount, in fileSystems order, with no
+	// length to skip by. That order is the order Mount() first saw each prefix during boot, which
+	// spans more than MountFileSystems() - booting an ISO, MountGameISO() has already added umd0:,
+	// umd1:, umd: and disc0: by the time we get there. An older build's savestate simply lacks the
+	// sections for mounts that didn't exist yet, and we have to leave out exactly those to stay
+	// lined up. We only know how many are missing (n), not which, hence the list below.
+	//
+	// Mounts added before version 2, newest first: a state missing k mounts is missing the k most
+	// recently added ones. Mounts added since don't go here (version 2 states name their mounts),
+	// but old states still rely on the existing mounts keeping their relative order.
+	static const char * const mountsAddedOverTime[] = { "flash1:", "pfat0:" };
+
+	const size_t missing = n < (u32)fileSystems.size() ? fileSystems.size() - n : 0;
+	if (n > (u32)fileSystems.size() || missing > ARRAY_SIZE(mountsAddedOverTime)) {
+		p.SetError(p.ERROR_FAILURE);
+		ERROR_LOG(Log::FileSystem, "Savestate failure: number of filesystems doesn't match (%d in state, %d mounted).", (int)n, (int)fileSystems.size());
+		return;
+	}
+
+	for (const MountPoint &mount : fileSystems) {
+		bool skip = false;
+		for (size_t i = 0; i < missing; i++) {
+			if (mount.prefix == mountsAddedOverTime[i]) {
+				skip = true;
+				break;
+			}
+		}
+		if (!skip) {
+			mount.system->DoState(p);
 		}
 	}
 }

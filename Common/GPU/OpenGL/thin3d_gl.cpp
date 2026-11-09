@@ -201,7 +201,6 @@ GLuint ShaderStageToOpenGL(ShaderStage stage) {
 	case ShaderStage::Vertex: return GL_VERTEX_SHADER;
 #ifndef USING_GLES2
 	case ShaderStage::Compute: return GL_COMPUTE_SHADER;
-	case ShaderStage::Geometry: return GL_GEOMETRY_SHADER;
 #endif
 	case ShaderStage::Fragment:
 	default:
@@ -334,6 +333,7 @@ public:
 	void SetTargetSize(int w, int h) override {
 		DrawContext::SetTargetSize(w, h);
 		renderManager_.Resize(w, h);
+		primarySwapchain_->SetSize(w, h);
 	}
 
 	const DeviceCaps &GetDeviceCaps() const override {
@@ -378,6 +378,7 @@ public:
 
 	void UpdateBuffer(Buffer *buffer, const uint8_t *data, size_t offset, size_t size, UpdateBufferFlags flags) override;
 	void UpdateTextureLevels(Texture *texture, const uint8_t **data, TextureCallback initDataCallback, int numLevels) override;
+	void UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) override;
 
 	void CopyFramebufferImage(Framebuffer *src, int level, int x, int y, int z, Framebuffer *dst, int dstLevel, int dstX, int dstY, int dstZ, int width, int height, int depth, Aspect aspects, const char *tag) override;
 	bool BlitFramebuffer(Framebuffer *src, int srcX1, int srcY1, int srcX2, int srcY2, Framebuffer *dst, int dstX1, int dstY1, int dstX2, int dstY2, Aspect aspects, FBBlitFilter filter, const char *tag) override;
@@ -534,26 +535,6 @@ private:
 	PresentMode requestedPresentMode_{};
 };
 
-static constexpr int MakeIntelSimpleVer(int v1, int v2, int v3) {
-	return (v1 << 16) | (v2 << 8) | v3;
-}
-
-static bool HasIntelDualSrcBug(const int versions[4]) {
-	// Intel uses a confusing set of at least 3 version numbering schemes.  This is the one given to OpenGL.
-	switch (MakeIntelSimpleVer(versions[0], versions[1], versions[2])) {
-	case MakeIntelSimpleVer(9, 17, 10):
-	case MakeIntelSimpleVer(9, 18, 10):
-		return false;
-	case MakeIntelSimpleVer(10, 18, 10):
-		return versions[3] < 4061;
-	case MakeIntelSimpleVer(10, 18, 14):
-		return versions[3] < 4080;
-	default:
-		// Older than above didn't support dual src anyway, newer should have the fix.
-		return false;
-	}
-}
-
 OpenGLContext::OpenGLContext(bool canChangeSwapInterval) : renderManager_(frameTimeHistory_) {
 	if (gl_extensions.IsGLES) {
 		if (gl_extensions.OES_packed_depth_stencil || gl_extensions.OES_depth24) {
@@ -568,6 +549,8 @@ OpenGLContext::OpenGLContext(bool canChangeSwapInterval) : renderManager_(frameT
 			// 30 is an ok value for the max since it's 2^31-1, which is the max value for a signed int. NVIDIA also reports this.
 			caps_.samplerLodControl = true;
 		}
+		// GL_TEXTURE_LOD_BIAS is desktop GL only, so the shader has to apply the bias.
+		caps_.samplerLodBias = false;
 		caps_.texture3DSupported = gl_extensions.GLES3 || gl_extensions.OES_texture_3D;
 		caps_.textureDepthSupported = gl_extensions.GLES3 || gl_extensions.OES_depth_texture;
 	} else {
@@ -610,7 +593,8 @@ OpenGLContext::OpenGLContext(bool canChangeSwapInterval) : renderManager_(frameT
 	caps_.fragmentShaderStencilWriteSupported = gl_extensions.ARB_shader_stencil_export;
 
 	// GLES has no support for logic framebuffer operations. There doesn't even seem to exist any such extensions.
-	caps_.logicOpSupported = !gl_extensions.IsGLES;
+	// Apple's OpenGL on Apple GPUs (on top of Metal, which has none either) accepts glLogicOp and ignores it.
+	caps_.logicOpSupported = !gl_extensions.IsGLES && gl_extensions.gpuVendor != GPU_VENDOR_APPLE;
 
 	// Always the case in GL (which is what we want for PSP flat shade).
 	caps_.provokingVertexLast = true;
@@ -647,17 +631,6 @@ OpenGLContext::OpenGLContext(bool canChangeSwapInterval) : renderManager_(frameT
 	if (!gl_extensions.VersionGEThan(3, 0, 0)) {
 		// Don't use this extension on sub 3.0 OpenGL versions as it does not seem reliable.
 		bugs_.Infest(Bugs::DUAL_SOURCE_BLENDING_BROKEN);
-	} else if (caps_.vendor == GPUVendor::VENDOR_INTEL) {
-		// Note: this is for Intel drivers with GL3+.
-		// Also on Intel, see https://github.com/hrydgard/ppsspp/issues/10117
-		// TODO: Remove entirely sometime reasonably far in driver years after 2015.
-		const std::string ver = OpenGLContext::GetInfoString(Draw::InfoField::APIVERSION);
-		int versions[4]{};
-		if (sscanf(ver.c_str(), "Build %d.%d.%d.%d", &versions[0], &versions[1], &versions[2], &versions[3]) == 4) {
-			if (HasIntelDualSrcBug(versions)) {
-				bugs_.Infest(Bugs::DUAL_SOURCE_BLENDING_BROKEN);
-			}
-		}
 	}
 
 #if PPSSPP_ARCH(ARMV7)
@@ -703,6 +676,10 @@ OpenGLContext::OpenGLContext(bool canChangeSwapInterval) : renderManager_(frameT
 #endif
 
 	shaderLanguageDesc_.Init(GLSL_1xx);
+	// With clip control set up by GLQueueRunner, depth is 0 to w like in Vulkan. Without it, window depth 0
+	// comes from z = -w, where the rasterizer rounds to an ulp of 1.0 rather than of 0: a flat ground at
+	// z = 0 got depths just above 0, and sprites on it that test GEQUAL failed (Puyo Puyo Fever 2).
+	shaderLanguageDesc_.depthMinusOneToOne = !(gl_extensions.ARB_clip_control || gl_extensions.EXT_clip_control);
 
 	shaderLanguageDesc_.glslVersionNumber = gl_extensions.GLSLVersion();
 
@@ -892,6 +869,7 @@ public:
 	}
 
 	void UpdateTextureLevels(GLRenderManager *render, const uint8_t *const *data, int numLevels, TextureCallback initDataCallback);
+	void UpdateTextureRegions(GLRenderManager *render, int level, const TextureRegionUpdate *regions, int numRegions);
 
 private:
 	void SetImageData(int x, int y, int z, int width, int height, int depth, int level, int stride, const uint8_t *data, TextureCallback initDataCallback);
@@ -952,6 +930,23 @@ void OpenGLTexture::UpdateTextureLevels(GLRenderManager *render, const uint8_t *
 	render->FinalizeTexture(tex_, mipLevels_, genMips);
 }
 
+void OpenGLTexture::UpdateTextureRegions(GLRenderManager *render, int level, const TextureRegionUpdate *regions, int numRegions) {
+	const int pixelSize = (int)DataFormatSizeInBytes(format_);
+	for (int i = 0; i < numRegions; i++) {
+		const TextureRegionUpdate &region = regions[i];
+		_dbg_assert_(region.w > 0 && region.h > 0);
+		const int srcStride = region.byteStride ? region.byteStride : region.w * pixelSize;
+		const int dstStride = region.w * pixelSize;
+		// glTexSubImage2D could take the stride through GL_UNPACK_ROW_LENGTH, but that's not in GLES2,
+		// and the queue runner owns the data anyway, so just pack it here.
+		uint8_t *texData = new uint8_t[(size_t)dstStride * region.h];
+		for (int y = 0; y < region.h; y++) {
+			memcpy(texData + (size_t)dstStride * y, region.data + (size_t)srcStride * y, dstStride);
+		}
+		render->TextureSubImageInit(tex_, level, region.x, region.y, region.w, region.h, format_, texData);
+	}
+}
+
 OpenGLTexture::~OpenGLTexture() {
 	if (tex_) {
 		render_->DeleteTexture(tex_);
@@ -965,6 +960,7 @@ public:
 	OpenGLFramebuffer(GLRenderManager *render, GLRFramebuffer *framebuffer) : render_(render), framebuffer_(framebuffer) {
 		width_ = framebuffer->width;
 		height_ = framebuffer->height;
+		hasDepthStencil_ = framebuffer->z_stencil_;
 	}
 	~OpenGLFramebuffer() {
 		render_->DeleteFramebuffer(framebuffer_);
@@ -1052,6 +1048,7 @@ static void LogReadPixelsError(GLenum error) {
 #endif
 
 bool OpenGLContext::CopyFramebufferToMemory(Framebuffer *src, Aspect channelBits, int x, int y, int w, int h, Draw::DataFormat dataFormat, void *pixels, int pixelStride, ReadbackMode mode, const char *tag) {
+	src = PrimaryToNull(src);
 	if (gl_extensions.IsGLES && (channelBits & Aspect::COLOR_BIT) == 0) {
 		// Can't readback depth or stencil on GLES.
 		return false;
@@ -1075,6 +1072,11 @@ Texture *OpenGLContext::CreateTexture(const TextureDesc &desc) {
 void OpenGLContext::UpdateTextureLevels(Texture *texture, const uint8_t **data, TextureCallback initDataCallback, int numLevels) {
 	OpenGLTexture *tex = (OpenGLTexture *)texture;
 	tex->UpdateTextureLevels(&renderManager_, data, numLevels, initDataCallback);
+}
+
+void OpenGLContext::UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) {
+	OpenGLTexture *tex = (OpenGLTexture *)texture;
+	tex->UpdateTextureRegions(&renderManager_, level, regions, numRegions);
 }
 
 DepthStencilState *OpenGLContext::CreateDepthStencilState(const DepthStencilStateDesc &desc) {
@@ -1584,6 +1586,7 @@ Framebuffer *OpenGLContext::CreateFramebuffer(const FramebufferDesc &desc) {
 }
 
 void OpenGLContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) {
+	fbo = PrimaryToNull(fbo);
 	OpenGLFramebuffer *fb = (OpenGLFramebuffer *)fbo;
 	GLRRenderPassAction color = (GLRRenderPassAction)rp.color;
 	GLRRenderPassAction depth = (GLRRenderPassAction)rp.depth;
@@ -1596,6 +1599,14 @@ void OpenGLContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const Render
 void OpenGLContext::CopyFramebufferImage(Framebuffer *fbsrc, int srcLevel, int srcX, int srcY, int srcZ, Framebuffer *fbdst, int dstLevel, int dstX, int dstY, int dstZ, int width, int height, int depth, Aspect aspects, const char *tag) {
 	OpenGLFramebuffer *src = (OpenGLFramebuffer *)fbsrc;
 	OpenGLFramebuffer *dst = (OpenGLFramebuffer *)fbdst;
+
+	if (aspects & (Aspect::DEPTH_BIT | Aspect::STENCIL_BIT)) {
+		_dbg_assert_msg_(src->HasDepthStencil(), "%s", src->framebuffer_->Tag());
+		_dbg_assert_msg_(dst->HasDepthStencil(), "%s", dst->framebuffer_->Tag());
+		if (!src->HasDepthStencil() || !dst->HasDepthStencil()) {
+			return;
+		}
+	}
 
 	int glAspect = 0;
 	if (aspects & Aspect::COLOR_BIT) {
@@ -1612,6 +1623,14 @@ void OpenGLContext::CopyFramebufferImage(Framebuffer *fbsrc, int srcLevel, int s
 bool OpenGLContext::BlitFramebuffer(Framebuffer *fbsrc, int srcX1, int srcY1, int srcX2, int srcY2, Framebuffer *fbdst, int dstX1, int dstY1, int dstX2, int dstY2, Aspect aspects, FBBlitFilter linearFilter, const char *tag) {
 	OpenGLFramebuffer *src = (OpenGLFramebuffer *)fbsrc;
 	OpenGLFramebuffer *dst = (OpenGLFramebuffer *)fbdst;
+	if (aspects & (Aspect::DEPTH_BIT | Aspect::STENCIL_BIT)) {
+		_dbg_assert_msg_(src->HasDepthStencil(), "%s", src->framebuffer_->Tag());
+		_dbg_assert_msg_(dst->HasDepthStencil(), "%s", dst->framebuffer_->Tag());
+		if (!src->HasDepthStencil() || !dst->HasDepthStencil()) {
+			return false;
+		}
+	}
+
 	GLuint aspect = 0;
 	if (aspects & Aspect::COLOR_BIT)
 		aspect |= GL_COLOR_BUFFER_BIT;
@@ -1647,6 +1666,7 @@ void OpenGLContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspe
 }
 
 void OpenGLContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) {
+	fbo = PrimaryToNull(fbo);
 	OpenGLFramebuffer *fb = (OpenGLFramebuffer *)fbo;
 	if (fb) {
 		*w = fb->Width();

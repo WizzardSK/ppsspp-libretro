@@ -178,7 +178,8 @@ void VKRFramebuffer::CreateImage(VulkanContext *vulkan, VulkanBarrierBatch *barr
 	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
 	ici.format = format;
 	ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	if (sampleCount == VK_SAMPLE_COUNT_1_BIT) {
+	// Multisampled color is sampled too, to read single samples where averaging them would be wrong.
+	if (sampleCount == VK_SAMPLE_COUNT_1_BIT || color) {
 		ici.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
 	}
 	if (color) {
@@ -298,7 +299,8 @@ VkRenderPass CreateRenderPass(VulkanContext *vulkan, const RPKey &key, RenderPas
 		_dbg_assert_(key.stencilLoadAction != VKRRenderPassLoadAction::KEEP);
 	}
 	bool hasDepth = RenderPassTypeHasDepth(rpType);
-	bool multiview = RenderPassTypeHasMultiView(rpType);
+	// A layered backbuffer (VR) is drawn to with multiview, so every pipeline compiled for it matches.
+	bool multiview = RenderPassTypeHasMultiView(rpType) || (isBackbuffer && vulkan->GetBackbufferLayers() > 1);
 	bool multisample = RenderPassTypeHasMultisample(rpType);
 
 	_dbg_assert_(!(isBackbuffer && multisample));
@@ -558,6 +560,9 @@ VkRenderPass VKRRenderPass::Get(VulkanContext *vulkan, RenderPassType rpType, Vk
 	// So you CAN NOT mix and match different non-one sample counts.
 
 	_dbg_assert_(!((rpType & RenderPassType::MULTISAMPLE) && sampleCount == VK_SAMPLE_COUNT_1_BIT));
+
+	// Called from both the main thread and the render thread, see the note on mutex_.
+	std::lock_guard<std::mutex> lock(mutex_);
 
 	if (!pass[(int)rpType] || sampleCounts[(int)rpType] != sampleCount) {
 		if (pass[(int)rpType]) {

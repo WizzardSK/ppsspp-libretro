@@ -71,6 +71,7 @@
 #include "Windows/InputDevice.h"
 #include "Windows/MainWindow.h"
 #include "Windows/CaptureDevice.h"
+#include "Windows/WASAPIMicrophone.h"
 #include "Windows/Debugger/Debugger_Disasm.h"
 #include "Windows/Debugger/Debugger_MemoryDlg.h"
 #include "Windows/Debugger/Debugger_VFPUDlg.h"
@@ -144,7 +145,6 @@ void System_LaunchUrl(LaunchUrlType urlType, std::string_view url) {
 	case LaunchUrlType::BROWSER_URL:
 	case LaunchUrlType::LOCAL_FILE:
 	case LaunchUrlType::LOCAL_FOLDER:
-	case LaunchUrlType::MARKET_URL:
 	case LaunchUrlType::EMAIL_ADDRESS:
 		// ShellExecute handles everything.
 	{
@@ -317,6 +317,8 @@ std::vector<std::string> System_GetPropertyStringVec(SystemProperty prop) {
 			result.push_back(getenv("TEMP"));
 		return result;
 	}
+	case SYSPROP_MICROPHONE_DEVICE_LIST:
+		return WASAPIMicrophoneGetDeviceList();
 
 	default:
 		return result;
@@ -399,9 +401,13 @@ int64_t System_GetPropertyInt(SystemProperty prop) {
 	{
 		SYSTEM_POWER_STATUS status{};
 		if (GetSystemPowerStatus(&status)) {
+			// -1 without a battery (a desktop), like SDL_GetPowerInfo.
+			if (status.BatteryFlag == 128 || status.BatteryFlag == 255) {
+				return -1;
+			}
 			return status.BatteryLifePercent < 255 ? status.BatteryLifePercent : 100;
 		} else {
-			return 100;
+			return -1;
 		}
 	}
 	default:
@@ -451,11 +457,15 @@ bool System_GetPropertyBool(SystemProperty prop) {
 	case SYSPROP_HAS_TEXT_INPUT_DIALOG:
 	case SYSPROP_CAN_CREATE_SHORTCUT:
 	case SYSPROP_CAN_SHOW_FILE:
+	case SYSPROP_CAN_LAUNCH_URL:
 	case SYSPROP_HAS_TRASH_BIN:
+	case SYSPROP_SUPPORTS_SHARE_FILE:
 		return true;
 	case SYSPROP_HAS_IMAGE_BROWSER:
 		return true;
 	case SYSPROP_HAS_BACK_BUTTON:
+		return true;
+	case SYSPROP_MICROPHONE_NEEDS_POLLING:
 		return true;
 	case SYSPROP_HAS_LOGIN_DIALOG:
 		return true;
@@ -508,7 +518,7 @@ void System_Notify(SystemNotification notification) {
 	case SystemNotification::BOOT_DONE:
 	{
 		if (g_symbolMap)
-			g_symbolMap->SortSymbols();  // Always fired from the CPU/NativeFrame thread, see AGENTS.md
+			g_symbolMap->SortSymbols();  // Fired from the CPU/NativeFrame thread. See docs/DebuggerThreading.md.
 		PostMessage(MainWindow::GetHWND(), WM_USER + 1, 0, 0);
 
 		if (Achievements::HardcoreModeActive()) {
@@ -547,8 +557,10 @@ void System_Notify(SystemNotification notification) {
 		break;
 
 	case SystemNotification::SYMBOL_MAP_UPDATED:
+		// Fired by whichever thread just changed the map: the CPU thread, or the loader thread while
+		// booting (see PSP_IsBooting). See docs/DebuggerThreading.md.
 		if (g_symbolMap)
-			g_symbolMap->SortSymbols();  // Always fired from the CPU/NativeFrame thread, see AGENTS.md
+			g_symbolMap->SortSymbols();
 		PostMessage(MainWindow::GetHWND(), WM_USER + 1, 0, 0);
 		break;
 
@@ -631,7 +643,7 @@ static std::wstring FinalizeFilter(std::wstring filter) {
 static std::wstring MakeWindowsFilter(BrowseFileType type) {
 	switch (type) {
 	case BrowseFileType::BOOTABLE:
-		return FinalizeFilter(L"All supported file types (*.iso *.cso *.chd *.pbp *.elf *.prx *.zip *.ppdmp)|*.pbp;*.elf;*.iso;*.cso;*.chd;*.prx;*.zip;*.ppdmp|PSP ROMs (*.iso *.cso *.chd *.pbp *.elf *.prx)|*.pbp;*.elf;*.iso;*.cso;*.chd;*.prx|Homebrew/Demos installers (*.zip)|*.zip|All files (*.*)|*.*||");
+		return FinalizeFilter(L"All supported file types (*.iso *.cso *.chd *.pbp *.elf *.prx *.zip *.ppdmp *.cue *.ccd *.mds *.mdf *.bin *.img)|*.pbp;*.elf;*.iso;*.cso;*.chd;*.prx;*.zip;*.ppdmp;*.cue;*.ccd;*.mds;*.mdf;*.bin;*.img|PSP ROMs (*.iso *.cso *.chd *.pbp *.elf *.prx)|*.pbp;*.elf;*.iso;*.cso;*.chd;*.prx|PS1 disc images (*.cue *.ccd *.mds *.mdf *.chd *.bin *.img *.iso *.pbp)|*.cue;*.ccd;*.mds;*.mdf;*.chd;*.bin;*.img;*.iso;*.pbp|Homebrew/Demos installers (*.zip)|*.zip|All files (*.*)|*.*||");
 	case BrowseFileType::SAVE_STATE:
 		return FinalizeFilter(L"Save state files (*.ppst)|*.ppst|All files (*.*)|*.*||");
 	case BrowseFileType::INI:
@@ -777,6 +789,38 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 		}).detach();
 		return true;
 
+	case SystemRequestType::SHARE_FILE:
+	{
+		// No share sheet here yet, so offer to save a copy instead. param2 (the MIME type) isn't needed.
+		const Path source(param1);
+		if (!File::Exists(source)) {
+			ERROR_LOG(Log::System, "SHARE_FILE: '%s' doesn't exist", param1.c_str());
+			return false;
+		}
+		std::thread([source] {
+			SetCurrentThreadName("ShareFile");
+			std::wstring filter;
+			std::wstring extension;
+			const std::string ext = source.GetFileExtension();  // Lowercase, with the dot.
+			if (ext.size() > 1) {
+				extension = ConvertUTF8ToWString(ext.substr(1));
+				std::wstring upper = extension;
+				std::transform(upper.begin(), upper.end(), upper.begin(), towupper);
+				filter = upper + L" files (*." + extension + L")|*." + extension + L"|";
+			}
+			filter = FinalizeFilter(filter + L"All files (*.*)|*.*||");
+			std::string out;
+			if (!W32Util::BrowseForFileName(false, MainWindow::GetHWND(), L"", nullptr, ConvertUTF8ToWString(source.GetFilename()).c_str(), filter.c_str(), extension.c_str(), out)) {
+				return;
+			}
+			const Path dest(out);
+			if (dest != source && !File::Copy(source, dest)) {
+				ERROR_LOG(Log::System, "SHARE_FILE: Couldn't copy '%s' to '%s'", source.c_str(), dest.c_str());
+			}
+		}).detach();
+		return true;
+	}
+
 	case SystemRequestType::APPLY_FULLSCREEN_STATE:
 	{
 		MainWindow::SendApplyFullscreenState();
@@ -832,6 +876,24 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 		W32Util::OpenDisplaySettings();
 		return true;
 	}
+	case SystemRequestType::MICROPHONE_COMMAND:
+		// From the CPU thread.
+		if (startsWith(param1, "startRecording:")) {
+			int sampleRate = 0;
+			if (sscanf(param1.c_str(), "startRecording:%d", &sampleRate) != 1 || sampleRate <= 0) {
+				return false;
+			}
+			WASAPIMicrophoneStart(sampleRate);
+		} else if (param1 == "stopRecording") {
+			WASAPIMicrophoneStop();
+		} else if (param1 == "pollRecording") {
+			WASAPIMicrophonePoll();
+		} else if (param1 == "deviceChanged") {
+			WASAPIMicrophoneDeviceChanged();
+		} else {
+			return false;
+		}
+		return true;
 	default:
 		return false;
 	}
@@ -1208,6 +1270,10 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 	HWND hwndMain = MainWindow::GetHWND();
 	Achievements::InitializeRAIntegration(hwndMain);
 
+	if (cmdLineOptions.gameWindow.value_or(false)) {
+		MainWindow::CreateGameWindow();
+	}
+
 	//initialize custom controls
 	CtrlDisAsmView::init();
 	CtrlMemView::init();
@@ -1251,8 +1317,8 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 			[](GraphicsContext *graphicsContext) {
 				NativeFrame(graphicsContext);
 				return GetUIState() != UISTATE_EXIT;
-		})) {
-			HandleGraphicsFailure("Failed to initialize main thread function.");
+		}, &errorMessage)) {
+			HandleGraphicsFailure(errorMessage);
 			return;
 		}
 		graphicsContext->ShutdownAPI();
@@ -1311,17 +1377,23 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 
 	// Already stopped?
 	_dbg_assert_(mainThread.joinable());
+	INFO_LOG(Log::System, "Waiting for the main thread to exit");
 	mainThread.join();
+	INFO_LOG(Log::System, "Main thread exited");
+
+	// The debugger windows reach into core state as they go away (CtrlDisAsmView touches
+	// g_disassemblyManager, for example), so tear them down while the core is still around.
+	MainWindow::DestroyDebugWindows();
+	DialogManager::DestroyAll();
 
 	// It's safe to call NativeShutdown, we've joined the main thread.
 	NativeShutdown();
+	// The game shut down the microphone with the core, but its thread mustn't outlive us either way.
+	WASAPIMicrophoneStop();
 
 	g_VFS.Clear();
 
 	// g_InputManager.StopPolling() is called in WM_DESTROY
-
-	MainWindow::DestroyDebugWindows();
-	DialogManager::DestroyAll();
 
 	TimeShutdown();
 

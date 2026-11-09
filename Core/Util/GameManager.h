@@ -27,6 +27,7 @@
 #include <optional>
 
 #include "Common/Net/HTTPClient.h"
+#include "Common/Data/Text/I18n.h"
 
 enum class GameManagerState {
 	IDLE,
@@ -78,12 +79,15 @@ public:
 		return installProgress_;
 	}
 	void ResetInstallError();
-	std::string GetInstallError() const {
-		return installError_;
-	}
+	// Translated, empty if the last install didn't fail.
+	std::string GetInstallError() const;
 
 	// Only returns false if there's already an installation in progress.
 	bool InstallZipOnThread(ZipFileTask task);
+
+	// Installs a game update from a .pkg into PSP/GAME/<DISC_ID>. Same contract as the above -
+	// only returns false if something else is already installing. See Core/Util/PkgUnpack.h.
+	bool InstallPkgOnThread(const Path &pkgPath, bool deleteAfter);
 
 	// Separate kind of functionality from InstallZipOnThread, so doesn't re-use the task struct.
 	bool UninstallGameOnThread(const std::string &name);
@@ -91,9 +95,13 @@ public:
 	// Extracts the contents of an open zip archive into dest. Exposed for testing.
 	// maxTotalSize limits the total decompressed size (zip bomb protection).
 	bool ExtractZipContents(struct zip *z, const Path &dest, const ZipFileInfo &info, bool allowRoot, int64_t maxTotalSize = 0x100000000ULL);
+	// Extracts a PS1 disc's files (ZipFileInfo::discFiles), into a folder of their own if there's more
+	// than one. Exposed for testing.
+	bool InstallZippedPS1Disc(struct zip *z, const std::vector<std::string> &files, const Path &destDir);
 
 private:
 	void InstallZipContents(ZipFileTask task);
+	void InstallPkgContents(Path pkgPath, bool deleteAfter);
 	bool InstallMemstickZip(const Path &zipFile, const Path &dest, const ZipFileInfo &info);
 	bool InstallZippedISO(struct zip *z, int isoFileIndex, const Path &destDir);
 	void UninstallGame(const std::string &name);
@@ -102,7 +110,8 @@ private:
 
 	bool ExtractFile(struct zip *z, int file_index, const Path &outFilename, int64_t *bytesCopied, int64_t allBytes, int64_t maxTotalSize = 0x100000000ULL);
 	bool DetectTexturePackDest(struct zip *z, int iniIndex, Path &dest);
-	void SetInstallError(std::string_view err);
+	// key is a translation key in cat, translated when the UI asks for it.
+	void SetInstallError(I18NCat cat, const char *key);
 
 	bool InstallInProgress() const { return installThread_.joinable(); }
 
@@ -116,7 +125,8 @@ private:
 	std::atomic<bool> cleanRecentsAfter_{};
 
 	float installProgress_ = 0.0f;
-	std::string installError_;
+	I18NCat installErrorCat_{};
+	const char *installErrorKey_ = nullptr;
 };
 
 extern GameManager g_GameManager;

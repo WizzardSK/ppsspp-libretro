@@ -9,6 +9,13 @@
 
 namespace http {
 
+// Caps on a response body, so a server can't make us buffer until we run out of memory. Downloads
+// to a file are buffered in memory too, so they get a cap of their own.
+constexpr size_t MAX_RESPONSE_IN_MEMORY = 64 * 1024 * 1024;
+constexpr size_t MAX_RESPONSE_TO_FILE = 1024 * 1024 * 1024;
+// Redirects we follow before giving up.
+constexpr int MAX_REDIRECTS = 10;
+
 enum class RequestMethod {
 	GET,
 	POST,
@@ -75,7 +82,9 @@ public:
 		flags_ |= flag;
 	}
 
-	void Cancel() { cancelled_ = true; }
+	// Virtual so a backend can act on it. The HTTPS one has to tell naett, which is what actually
+	// stops a transfer in progress - see HTTPSRequest::Cancel.
+	virtual void Cancel() { cancelled_ = true; }
 	bool IsCancelled() const { return cancelled_; }
 
 	// If not downloading to a file, access this to get the result.

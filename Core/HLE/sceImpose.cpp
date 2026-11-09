@@ -20,6 +20,8 @@
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/FunctionWrappers.h"
 #include "Core/HLE/ErrorCodes.h"
+#include "Core/HLE/PopsBoot.h"
+#include "Core/HLE/sceCtrl.h"
 #include "Core/HLE/sceImpose.h"
 #include "Core/HLE/sceUtility.h"
 #include "Core/MIPS/MIPS.h"
@@ -70,6 +72,9 @@ void __ImposeDoState(PointerWrap &p) {
 	if (s >= 2) {
 		Do(p, imposeChanges);
 		Do(p, imposeAvls);
+	} else if (p.mode == p.MODE_READ) {
+		imposeChanges = 0;
+		imposeAvls = 0;
 	}
 }
 
@@ -121,6 +126,14 @@ static u32 sceImposeGetBacklightOffTime() {
 	return hleLogDebug(Log::sceUtility, backlightOffTime);
 }
 
+// Whether HOME is held, when impose leaves HOME to the application. impose.prx's init does that
+// for POPS (and application type 0x400), so for a game it's always 0. The PS1 emulator polls it for
+// its menu.
+static u32 sceImpose_9BA61B49() {
+	const bool held = PopsBootActive() && (__CtrlPeekButtons() & CTRL_HOME) != 0;
+	return hleLogVerbose(Log::sceUtility, held ? 1 : 0);
+}
+
 // OSD stuff? home button?
 const HLEFunction sceImpose[] = {
 	{0X36AA6E91, &WrapU_UU<sceImposeSetLanguageMode>,      "sceImposeSetLanguageMode",      'i', "ii"},
@@ -136,7 +149,7 @@ const HLEFunction sceImpose[] = {
 	{0XFCD44963, nullptr,                                  "sceImpose_FCD44963",            '?', ""  },
 	{0XA9884B00, nullptr,                                  "sceImpose_A9884B00",            '?', ""  },
 	{0XBB3F5DEC, nullptr,                                  "sceImpose_BB3F5DEC",            '?', ""  },
-	{0X9BA61B49, nullptr,                                  "sceImpose_9BA61B49",            '?', ""  }, // jpcsp: isHomeButtonPressed() -> bool
+	{0X9BA61B49, &WrapU_V<sceImpose_9BA61B49>,             "sceImpose_9BA61B49",            'x', ""  },
 	{0XFF1A2F07, nullptr,                                  "sceImpose_FF1A2F07",            '?', ""  },
 };
 
@@ -165,8 +178,9 @@ enum : u32 {
 	PSP_IMPOSE_00000100               = 0x100,
 	PSP_IMPOSE_BACKLIGHT_OFF_INTERVAL = 0x200,
 	PSP_IMPOSE_SOUND_REDUCTION        = 0x400,
-	// Named after their own values, as in JPCSP - real meanings unknown.
+	// Real meanings of the below are unknown.
 	PSP_IMPOSE_20000000               = 0x20000000,
+	PSP_IMPOSE_40000000               = 0x40000000,
 	PSP_IMPOSE_80000001               = 0x80000001,
 	PSP_IMPOSE_80000002               = 0x80000002,
 	PSP_IMPOSE_80000003               = 0x80000003,
@@ -204,6 +218,7 @@ static int sceImposeGetParam(int param) {
 	case PSP_IMPOSE_DATE_FORMAT:
 	case PSP_IMPOSE_LANGUAGE:
 	case PSP_IMPOSE_00000100:
+	case PSP_IMPOSE_40000000:
 	case PSP_IMPOSE_20000000:
 	case PSP_IMPOSE_80000001:
 	case PSP_IMPOSE_80000002:
@@ -262,6 +277,26 @@ const HLEFunction sceImpose_driver[] = {
 	{0XBB12F974, &WrapI_I<sceImposeSetStatus>,             "sceImposeSetStatus",            'i', "i" },
 	// The 6.60 name for the same call the user-mode module exports as 0x8C943191.
 	{0X5557F4E2, &WrapU_UU<sceImposeGetBatteryIconStatus>, "sceImposeGetBatteryIconStatus", 'x', "xx"},
+	// The 1.50 - 2.xx NIDs for the same two calls - impose.prx of that era exports them to kernel
+	// mode only, with no user-mode alias to match them against, so these were identified from the
+	// function bodies.
+	{0X531C9778, &WrapI_I<sceImposeGetParam>,             "sceImposeGetParam",             'i', "i" },
+	{0XB415FC59, &WrapI_V<sceImposeChanges>,              "sceImposeChanges",              'i', ""  },
+	// And the 5.xx NIDs for four of them, identified by code.
+	{0XC860DB52, &WrapI_I<sceImposeSetStatus>,            "sceImposeSetStatus",            'i', "i" },
+	{0X4B02F047, &WrapI_I<sceImposeGetParam>,             "sceImposeGetParam",             'i', "i" },
+	{0XD1E9019F, &WrapI_II<sceImposeSetParam>,            "sceImposeSetParam",             'i', "ii"},
+	{0X0BBCA0BF, &WrapI_V<sceImposeChanges>,              "sceImposeChanges",              'i', ""  },
+	// sceImposeSetStatus again, for 3.95/4.05, 6.00/6.20 and 6.31/6.39 - identical bodies, and the
+	// only sceImpose_driver import those shells call.
+	{0X8434B075, &WrapI_I<sceImposeSetStatus>,            "sceImposeSetStatus",            'i', "i" },
+	{0X01EF0650, &WrapI_I<sceImposeSetStatus>,            "sceImposeSetStatus",            'i', "i" },
+	{0X2462EFE4, &WrapI_I<sceImposeSetStatus>,            "sceImposeSetStatus",            'i', "i" },
+	{0XC10C3D39, &WrapI_I<sceImposeSetStatus>,            "sceImposeSetStatus",            'i', "i" },
+
+	// Unknown, spams in older firmwares (3.80). Probably aliases for Get something.
+	{0x21d3ea22, 0,                                       "sceImpose_21D3EA22",            '?', ""},
+	{0xd4fda428, 0,                                       "sceImpose_d4fda428",            '?', ""},
 };
 
 void Register_sceImpose_driver() {

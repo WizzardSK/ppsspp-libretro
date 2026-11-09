@@ -82,14 +82,16 @@ AndroidContentURI AndroidContentURI::WithExtraExtension(std::string_view extensi
 	return uri;
 }
 
-AndroidContentURI AndroidContentURI::WithReplacedExtension(const std::string &oldExtension, const std::string &newExtension) const {
+bool AndroidContentURI::WithReplacedExtension(const std::string &oldExtension, const std::string &newExtension, AndroidContentURI *out) const {
 	_dbg_assert_(!oldExtension.empty() && oldExtension[0] == '.');
 	_dbg_assert_(!newExtension.empty() && newExtension[0] == '.');
-	AndroidContentURI uri = *this;
-	if (endsWithNoCase(file, oldExtension)) {
-		uri.file = file.substr(0, file.size() - oldExtension.size()) + newExtension;
+	if (!endsWithNoCase(file, oldExtension)) {
+		return false;
 	}
-	return uri;
+	AndroidContentURI uri = *this;
+	uri.file = file.substr(0, file.size() - oldExtension.size()) + newExtension;
+	*out = uri;
+	return true;
 }
 
 AndroidContentURI AndroidContentURI::WithReplacedExtension(const std::string &newExtension) const {
@@ -113,14 +115,18 @@ bool AndroidContentURI::CanNavigateUp() const {
 
 // Only goes downwards in hierarchies. No ".." will ever be generated.
 bool AndroidContentURI::ComputePathTo(const AndroidContentURI &other, std::string &path) const {
-	size_t offset = FilePath().size() + 1;
-	const auto &otherFilePath = other.FilePath();
-	if (offset >= otherFilePath.size()) {
-		ERROR_LOG(Log::IO, "Bad call to PathTo. '%s' -> '%s'", FilePath().c_str(), other.FilePath().c_str());
+	const std::string &base = FilePath();
+	const std::string &otherFilePath = other.FilePath();
+	// The root of a volume ("primary:") ends in the colon, and then there's no separator to skip.
+	const bool endsInSeparator = !base.empty() && (base.back() == ':' || base.back() == '/');
+	const size_t offset = base.size() + (endsInSeparator ? 0 : 1);
+	// Only whole folder names: "primary:Games" isn't a parent of "primary:Games2".
+	if (offset >= otherFilePath.size() || !startsWith(otherFilePath, base) || (!endsInSeparator && otherFilePath[base.size()] != '/')) {
+		ERROR_LOG(Log::IO, "Bad call to PathTo. '%s' -> '%s'", base.c_str(), otherFilePath.c_str());
 		return false;
 	}
 
-	path = other.FilePath().substr(FilePath().size() + 1);
+	path = otherFilePath.substr(offset);
 	return true;
 }
 

@@ -23,6 +23,8 @@
 #include <sys/time.h>
 #endif
 
+#include <algorithm>
+#include <climits>
 #include <time.h>
 
 #include "Common/Serialize/Serializer.h"
@@ -39,12 +41,12 @@
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceRtc.h"
 
-#ifdef HAVE_LIBNX
+#if PPSSPP_PLATFORM(SWITCH)
 // I guess that works...
 #define setenv(x, y, z) (void*)0
 #define tzset() (void*)0
 #define unsetenv(x) (void*)0
-#endif // HAVE_LIBNX
+#endif // PPSSPP_PLATFORM(SWITCH)
 
 // This is a base time that everything is relative to.
 // This way, time doesn't move strangely with savestates, turbo speed, etc.
@@ -322,6 +324,19 @@ static u32 sceRtcGetCurrentClock(u32 pspTimePtr, int tz) {
 	return hleLogDebug(Log::sceRtc, 0);
 }
 
+bool __RtcGetCurrentLocalTime(ScePspDateTime *t) {
+	PSPTimeval tv;
+	__RtcTimeOfDay(&tv);
+	time_t sec = (time_t)tv.tv_sec;
+	const tm *local = localtime(&sec);
+	if (!local) {
+		return false;
+	}
+	__RtcTmToPspTime(*t, local);
+	t->microsecond = tv.tv_usec;
+	return true;
+}
+
 static u32 sceRtcGetCurrentClockLocalTime(u32 pspTimePtr) {
 	auto pt = PSPPointer<ScePspDateTime>::Create(pspTimePtr);
 
@@ -436,7 +451,7 @@ static u32 sceRtcIsLeapYear(u32 year)
 static int sceRtcConvertLocalTimeToUTC(u32 tickLocalPtr,u32 tickUTCPtr)
 {
 	DEBUG_LOG(Log::sceRtc, "sceRtcConvertLocalTimeToUTC(%d, %d)", tickLocalPtr, tickUTCPtr);
-	if (Memory::IsValidRange(tickLocalPtr, 8) && Memory::IsValidAddress(tickUTCPtr))
+	if (Memory::IsValidRange(tickLocalPtr, 8) && Memory::IsValidRange(tickUTCPtr, 8))
 	{
 		u64 srcTick = Memory::ReadUnchecked_U64(tickLocalPtr);
 		// TODO : Let the user select his timezone / daylight saving instead of taking system param ?
@@ -444,7 +459,7 @@ static int sceRtcConvertLocalTimeToUTC(u32 tickLocalPtr,u32 tickUTCPtr)
 		long timezone_val;
 		_get_timezone(&timezone_val);
 		srcTick -= -timezone_val * 1000000ULL;
-#elif !defined(_AIX) && !defined(__sgi) && !defined(__hpux) && !defined(HAVE_LIBNX)
+#elif !defined(_AIX) && !defined(__sgi) && !defined(__hpux) && !PPSSPP_PLATFORM(SWITCH)
 		time_t timezone = 0;
 		tm *time = localtime(&timezone);
 		srcTick -= time->tm_gmtoff*1000000ULL;
@@ -468,7 +483,7 @@ static int sceRtcConvertUtcToLocalTime(u32 tickUTCPtr, u32 tickLocalPtr)
 		long timezone_val;
 		_get_timezone(&timezone_val);
 		srcTick += -timezone_val * 1000000ULL;
-#elif !defined(_AIX) && !defined(__sgi) && !defined(__hpux) && !defined(HAVE_LIBNX)
+#elif !defined(_AIX) && !defined(__sgi) && !defined(__hpux) && !PPSSPP_PLATFORM(SWITCH)
 		time_t timezone = 0;
 		tm *time = localtime(&timezone);
 		srcTick += time->tm_gmtoff*1000000ULL;
@@ -591,7 +606,7 @@ static int sceRtcGetDosTime(u32 datePtr, u32 dosTime) {
 }
 
 static int sceRtcSetWin32FileTime(u32 datePtr, u64 win32Time) {
-	if (!Memory::IsValidAddress(datePtr))
+	if (!Memory::IsValidRange(datePtr, sizeof(ScePspDateTime)))
 	{
 		ERROR_LOG_REPORT(Log::sceRtc, "sceRtcSetWin32FileTime(%08x, %lld): invalid address", datePtr, win32Time);
 		return -1;
@@ -606,7 +621,7 @@ static int sceRtcSetWin32FileTime(u32 datePtr, u64 win32Time) {
 }
 
 static int sceRtcGetWin32FileTime(u32 datePtr, u32 win32TimePtr) {
-	if (!Memory::IsValidAddress(datePtr)) {
+	if (!Memory::IsValidRange(datePtr, sizeof(ScePspDateTime))) {
 		ERROR_LOG_REPORT(Log::sceRtc, "sceRtcGetWin32FileTime(%08x, %08x): invalid address", datePtr, win32TimePtr);
 		return -1;
 	}
@@ -902,7 +917,7 @@ static bool rtcParseRFC2822(const char *s, RtcParseResult &r) {
 
 static int sceRtcParseDateTime(u32 destTickPtr, u32 dateStringPtr)
 {
-	if (!Memory::IsValid4AlignedRange(destTickPtr, 8) || !Memory::IsValidAddress(dateStringPtr))
+	if (!Memory::IsValid4AlignedRange(destTickPtr, 8) || !Memory::IsValidNullTerminatedString(dateStringPtr))
 		return hleLogError(Log::sceRtc, -1, "bad address");
 
 	const char *s = Memory::GetCharPointer(dateStringPtr);
@@ -946,6 +961,14 @@ static int sceRtcSetAlarmTick(u32 unknown1, u32 unknown2) {
 	return hleLogError(Log::sceRtc, 0, "UNIMPL");
 }
 
+// "Has the RTC alarm fired?" - we don't model one and sceRtcSetAlarmTick above is a no-op, so the
+// answer is always no. Same as JPCSP, which returns a bare 0. Left unimplemented this returned
+// SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED, and the 3.0x-3.5x VSH took that as "ask the hardware
+// instead" and blocked forever on a syscon reply.
+static int sceRtcIsAlarmed() {
+	return hleLogDebug(Log::sceRtc, 0);
+}
+
 // Real signature per uofw (sceRtc_C2DDBEB5, src/kd/rtc/rtc.c): s32 sceRtcGetAlarmTick(u64 *tick).
 // PPSSPP doesn't track a real hardware RTC alarm, so there's nothing meaningful to report -
 // but leaving this fully unimplemented (nullptr in the function table) meant callers got back
@@ -977,7 +1000,8 @@ static int __RtcFormatRFC2822(u32 outPtr, u32 srcTickPtr, int tz) {
 		local.tm_year += 400;
 	while (local.tm_year >= 470)
 		local.tm_year -= 400;
-	local.tm_min += tz;
+	// tz is from the game, keep the sum from overflowing.
+	local.tm_min = (int)std::clamp<s64>((s64)local.tm_min + tz, INT_MIN / 2, INT_MAX / 2);
 	rtc_timegm(&local);
 
 	char *out = (char *)Memory::GetPointerWriteUnchecked(outPtr);
@@ -1008,7 +1032,8 @@ static int __RtcFormatRFC3339(u32 outPtr, u32 srcTickPtr, int tz) {
 		local.tm_year += 400;
 	while (local.tm_year >= 470)
 		local.tm_year -= 400;
-	local.tm_min += tz;
+	// tz is from the game, keep the sum from overflowing.
+	local.tm_min = (int)std::clamp<s64>((s64)local.tm_min + tz, INT_MIN / 2, INT_MAX / 2);
 	rtc_timegm(&local);
 
 	char *out = (char *)Memory::GetPointerWriteUnchecked(outPtr);
@@ -1027,7 +1052,7 @@ static int __RtcFormatRFC3339(u32 outPtr, u32 srcTickPtr, int tz) {
 
 static int sceRtcFormatRFC2822(u32 outPtr, u32 srcTickPtr, int tz)
 {
-	if (!Memory::IsValidAddress(outPtr) || !Memory::IsValid4AlignedRange(srcTickPtr, 8))
+	if (!Memory::IsValidRange(outPtr, 32) || !Memory::IsValid4AlignedRange(srcTickPtr, 8))
 	{
 		// TODO: Not well tested.
 		ERROR_LOG(Log::sceRtc, "sceRtcFormatRFC2822(%08x, %08x, %d): invalid address", outPtr, srcTickPtr, tz);
@@ -1040,7 +1065,7 @@ static int sceRtcFormatRFC2822(u32 outPtr, u32 srcTickPtr, int tz)
 
 static int sceRtcFormatRFC2822LocalTime(u32 outPtr, u32 srcTickPtr)
 {
-	if (!Memory::IsValidAddress(outPtr) || !Memory::IsValid4AlignedRange(srcTickPtr, 8))
+	if (!Memory::IsValidRange(outPtr, 32) || !Memory::IsValid4AlignedRange(srcTickPtr, 8))
 	{
 		// TODO: Not well tested.
 		ERROR_LOG(Log::sceRtc, "sceRtcFormatRFC2822LocalTime(%08x, %08x): invalid address", outPtr, srcTickPtr);
@@ -1052,7 +1077,7 @@ static int sceRtcFormatRFC2822LocalTime(u32 outPtr, u32 srcTickPtr)
 		long timezone_val;
 		_get_timezone(&timezone_val);
 		tz_seconds = -timezone_val;
-#elif !defined(_AIX) && !defined(__sgi) && !defined(__hpux) && !defined(HAVE_LIBNX)
+#elif !defined(_AIX) && !defined(__sgi) && !defined(__hpux) && !PPSSPP_PLATFORM(SWITCH)
 		time_t timezone = 0;
 		tm *time = localtime(&timezone);
 		tz_seconds = time->tm_gmtoff;
@@ -1064,7 +1089,7 @@ static int sceRtcFormatRFC2822LocalTime(u32 outPtr, u32 srcTickPtr)
 
 static int sceRtcFormatRFC3339(u32 outPtr, u32 srcTickPtr, int tz)
 {
-	if (!Memory::IsValidAddress(outPtr) || !Memory::IsValid4AlignedRange(srcTickPtr, 8))
+	if (!Memory::IsValidRange(outPtr, 32) || !Memory::IsValid4AlignedRange(srcTickPtr, 8))
 	{
 		// TODO: Not well tested.
 		ERROR_LOG(Log::sceRtc, "sceRtcFormatRFC3339(%08x, %08x, %d): invalid address", outPtr, srcTickPtr, tz);
@@ -1077,7 +1102,7 @@ static int sceRtcFormatRFC3339(u32 outPtr, u32 srcTickPtr, int tz)
 
 static int sceRtcFormatRFC3339LocalTime(u32 outPtr, u32 srcTickPtr)
 {
-	if (!Memory::IsValidAddress(outPtr) || !Memory::IsValid4AlignedRange(srcTickPtr, 8))
+	if (!Memory::IsValidRange(outPtr, 32) || !Memory::IsValid4AlignedRange(srcTickPtr, 8))
 	{
 		// TODO: Not well tested.
 		ERROR_LOG(Log::sceRtc, "sceRtcFormatRFC3339LocalTime(%08x, %08x): invalid address", outPtr, srcTickPtr);
@@ -1089,7 +1114,7 @@ static int sceRtcFormatRFC3339LocalTime(u32 outPtr, u32 srcTickPtr)
 		long timezone_val;
 		_get_timezone(&timezone_val);
 		tz_seconds = -timezone_val;
-#elif !defined(_AIX) && !defined(__sgi) && !defined(__hpux) && !defined(HAVE_LIBNX)
+#elif !defined(_AIX) && !defined(__sgi) && !defined(__hpux) && !PPSSPP_PLATFORM(SWITCH)
 		time_t timezone = 0;
 		tm *time = localtime(&timezone);
 		tz_seconds = time->tm_gmtoff;
@@ -1143,7 +1168,7 @@ const HLEFunction sceRtc[] =
 	{0X203CEB0D, &WrapI_U<sceRtcGetLastReincarnatedTime>,  "sceRtcGetLastReincarnatedTime",  'i', "x"  },
 	{0X7D1FBED3, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },
 	{0XF5FCC995, nullptr,                                  "sceRtcGetCurrentNetworkTick",    '?', ""   },
-	{0X81FCDA34, nullptr,                                  "sceRtcIsAlarmed",                '?', ""   },
+	{0X81FCDA34, &WrapI_V<sceRtcIsAlarmed>,                "sceRtcIsAlarmed",                'i', ""   },
 	{0XFB3B18CD, nullptr,                                  "sceRtcRegisterCallback",         '?', ""   },
 	{0X6A676D2D, nullptr,                                  "sceRtcUnregisterCallback",       '?', ""   },
 	{0XC2DDBEB5, &WrapI_U<sceRtcGetAlarmTick>,             "sceRtcGetAlarmTick",             'i', "x"  },
@@ -1154,14 +1179,31 @@ void Register_sceRtc()
 	RegisterHLEModule("sceRtc", ARRAY_SIZE(sceRtc), sceRtc);
 }
 
-// sceRtc_driver is the kernel-only alias some firmware-660+ modules (e.g. the VSH's
+// sceRtc_driver is the kernel-only alias some firmware modules (e.g. the VSH's
 // sceVshBridge_Driver) import from instead of plain sceRtc - same underlying functions,
 // just also exported under a second, kernel-suffixed module name. Confirmed by cross-
 // checking jpcsp's sceRtc.java, which registers 0xE09880CF as an alternate NID on the exact
 // same sceRtcSetAlarmTick() method (JPCSP doesn't distinguish import module names the way
 // PPSSPP's HLE dispatch does, but the NID->function mapping is the same either way).
+//
+// Sony renumbered the kernel NIDs across firmware versions, so the same function has three of
+// them. All three are the export at rtc.prx+0xB28, which every one of these builds also
+// exports as the user-mode sceRtc/0x7D1FBED3 (sceRtcSetAlarmTick) - that's how they line up.
+// Covering the older two matters for the VSH: without the HLE, sceVshBridge_Driver's alarm
+// call lands in the real rtc.prx, which goes on into syscon.prx and blocks forever on a
+// SceSysconSync semaphore that never gets signalled.
 const HLEFunction sceRtc_driver[] = {
 	{0XE09880CF, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },
+	// NOTE: new entries go at the end - the syscall opcode in a savestate is an index into this array.
+	{0X54B9C589, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },  // 6.31 - 6.39
+	{0X68AED59A, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },  // 6.00 - 6.20
+	{0XADAF231F, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },  // 5.03 - 5.55
+	{0X55AC1C23, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },  // 3.95 - 4.05
+	{0X827BCB3F, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },  // 3.72 - 3.90
+	{0X329E8E3A, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },  // 3.71
+	// 3.51 and older didn't renumber it for kernel mode at all - the driver library exports it
+	// under the same NID as the user-mode one.
+	{0X7D1FBED3, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },  // 2.71 - 3.51
 };
 
 void Register_sceRtc_driver()

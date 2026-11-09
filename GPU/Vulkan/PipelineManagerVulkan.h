@@ -37,10 +37,10 @@ class VulkanRenderManager;
 class VulkanContext;
 class VulkanVertexShader;
 class VulkanFragmentShader;
-class VulkanGeometryShader;
 class ShaderManagerVulkan;
 class DrawEngineCommon;
 
+// Stored in the shader cache on disk: changing it requires bumping CACHE_VERSION in ShaderManagerVulkan.cpp.
 struct VulkanPipelineKey {
 	VulkanPipelineRasterStateKey raster;  // prim is included here
 	VShaderID vid;
@@ -63,6 +63,9 @@ private:
 
 // Simply wraps a Vulkan pipeline, providing some metadata.
 struct VulkanPipeline {
+	VulkanPipeline() = default;
+	VulkanPipeline(const VulkanPipeline &) = delete;
+	VulkanPipeline &operator=(const VulkanPipeline &) = delete;
 	~VulkanPipeline() {
 		desc->Release();
 	}
@@ -73,7 +76,6 @@ struct VulkanPipeline {
 
 	bool UsesBlendConstant() const { return (pipelineFlags & PipelineFlags::USES_BLEND_CONSTANT) != 0; }
 	bool UsesDepthStencil() const { return (pipelineFlags & PipelineFlags::USES_DEPTH_STENCIL) != 0; }
-	bool UsesGeometryShader() const { return (pipelineFlags & PipelineFlags::USES_GEOMETRY_SHADER) != 0; }
 	bool UsesDiscard() const { return (pipelineFlags & PipelineFlags::USES_DISCARD) != 0; }
 	bool UsesFlatShading() const { return (pipelineFlags & PipelineFlags::USES_FLAT_SHADING) != 0; }
 

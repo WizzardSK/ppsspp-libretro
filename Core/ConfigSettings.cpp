@@ -8,8 +8,16 @@
 #include "Core/ConfigValues.h"
 #include "Core/Config.h"
 
+void ConfigSettingTableError() {
+	_dbg_assert_msg_(false, "ConfigSetting info setter used on the wrong kind of setting");
+}
+
 bool ConfigSetting::PerGame(void *ptr) {
-	return g_Config.IsGameSpecific() && g_Config.getPtrLUT().count(ptr) > 0 && g_Config.getPtrLUT()[ptr].second->PerGame();
+	if (!g_Config.IsGameSpecific()) {
+		return false;
+	}
+	const ConfigSettingRef *ref = Config::FindSetting(ptr);
+	return ref && ref->setting->PerGame();
 }
 
 bool ConfigSetting::ReadFromIniSection(ConfigBlock *configBlock, const Section *section, bool applyDefaultIfMissing) const {
@@ -139,7 +147,7 @@ bool ConfigSetting::ReadFromIniSection(ConfigBlock *configBlock, const Section *
 				if (defaultCallback_.p) {
 					*target = defaultCallback_.p();
 				} else {
-					*target = Path(default_.p);
+					*target = Path(default_.s);
 				}
 			}
 			return false;
@@ -351,8 +359,8 @@ bool ConfigSetting::RestoreToDefault(ConfigBlock *configBlock, bool log) const {
 		if (defaultCallback_.p) {
 			*ptr_path = defaultCallback_.p();
 			break;
-		} else if (default_.p) {
-			*ptr_path = Path(default_.p);
+		} else if (default_.s) {
+			*ptr_path = Path(default_.s);
 		} else {
 			ptr_path->clear();
 		}
@@ -369,29 +377,6 @@ bool ConfigSetting::RestoreToDefault(ConfigBlock *configBlock, bool log) const {
 		break;
 	}
 	return false;
-}
-
-// Might be used to copy individual settings from defaulted blocks. Didn't end up using this for now.
-void ConfigSetting::CopyFromBlock(const ConfigBlock *other) {
-	_dbg_assert_(offset_ >= 0 && offset_ < other->Size());
-
-	const char *otherOwner = (const char *)other;
-	const char *thisOwner = (const char *)this;
-	switch (type_) {
-	case Type::TYPE_BOOL:   *(bool *)(thisOwner + offset_) = *(const bool *)(otherOwner + offset_); break;
-	case Type::TYPE_INT:    *(int *)(thisOwner + offset_) = *(const int *)(otherOwner + offset_); break;
-	case Type::TYPE_UINT32: *(uint32_t *)(thisOwner + offset_) = *(const uint32_t *)(otherOwner + offset_); break;
-	case Type::TYPE_UINT64: *(uint64_t *)(thisOwner + offset_) = *(const uint64_t *)(otherOwner + offset_); break;
-	case Type::TYPE_FLOAT: *(float *)(thisOwner + offset_) = *(const float *)(otherOwner + offset_); break;
-	case Type::TYPE_STRING: *(std::string *)(thisOwner + offset_) = *(const std::string *)(otherOwner + offset_); break;
-	case Type::TYPE_STRING_VECTOR: *(std::vector<std::string> *)(thisOwner + offset_) = *(const std::vector<std::string> *)(otherOwner + offset_); break;
-	case Type::TYPE_PATH:   *(Path *)(thisOwner + offset_) = *(const Path *)(otherOwner + offset_); break;
-	case Type::TYPE_TOUCH_POS: *(ConfigTouchPos *)(thisOwner + offset_) = *(const ConfigTouchPos *)(otherOwner + offset_); break;
-	case Type::TYPE_CUSTOM_BUTTON: *(ConfigCustomButton *)(thisOwner + offset_) = *(const ConfigCustomButton *)(otherOwner + offset_); break;
-	default:
-		_dbg_assert_msg_(false, "CopyFromBlock(%.*s): Unexpected setting type: %d", STR_VIEW(iniKey_), (int)type_);
-		return;
-	}
 }
 
 void ConfigSetting::ReportSetting(const ConfigBlock *configBlock, UrlEncoder &data, const std::string &prefix) const {
@@ -417,4 +402,52 @@ void ConfigSetting::ReportSetting(const ConfigBlock *configBlock, UrlEncoder &da
 		_dbg_assert_msg_(false, "Report(%s): Unexpected ini setting type: %d", key.c_str(), (int)type_);
 		return;
 	}
+}
+
+int ConfigSettingRef::GetIntValue() const {
+	_dbg_assert_(setting);
+	const void *ptr = setting->GetVoidPtr(block);
+	switch (setting->GetType()) {
+	case ConfigSetting::Type::TYPE_INT:
+		return *(const int *)ptr;
+	case ConfigSetting::Type::TYPE_BOOL:
+		return *(const bool *)ptr ? 1 : 0;
+	default:
+		ERROR_LOG(Log::Config, "ConfigSettingRef::GetIntValue: %.*s is not an int or bool", STR_VIEW(setting->IniKey()));
+		return 0;
+	}
+}
+
+void ConfigSettingRef::SetIntValue(int value) const {
+	_dbg_assert_(setting);
+	void *ptr = setting->VoidPtr(block);
+	switch (setting->GetType()) {
+	case ConfigSetting::Type::TYPE_INT:
+		*(int *)ptr = value;
+		break;
+	case ConfigSetting::Type::TYPE_BOOL:
+		*(bool *)ptr = value != 0;
+		break;
+	default:
+		ERROR_LOG(Log::Config, "ConfigSettingRef::SetIntValue: %.*s is not an int or bool", STR_VIEW(setting->IniKey()));
+		break;
+	}
+}
+
+const std::string *ConfigSettingRef::GetStringPtr() const {
+	_dbg_assert_(setting);
+	if (setting->GetType() != ConfigSetting::Type::TYPE_STRING) {
+		ERROR_LOG(Log::Config, "ConfigSettingRef::GetStringPtr: %.*s is not a string", STR_VIEW(setting->IniKey()));
+		return nullptr;
+	}
+	return (const std::string *)setting->GetVoidPtr(block);
+}
+
+void ConfigSettingRef::SetStringValue(std::string_view value) const {
+	_dbg_assert_(setting);
+	if (setting->GetType() != ConfigSetting::Type::TYPE_STRING) {
+		ERROR_LOG(Log::Config, "ConfigSettingRef::SetStringValue: %.*s is not a string", STR_VIEW(setting->IniKey()));
+		return;
+	}
+	*(std::string *)setting->VoidPtr(block) = std::string(value);
 }

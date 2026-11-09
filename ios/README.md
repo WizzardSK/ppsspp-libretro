@@ -1,10 +1,3 @@
-Updating with a self-built MoltenVK
-===================================
-
-Probably won't be needed again.
-
-cp -r ../dev/build-molten/MoltenVK/Package/Release/MoltenVK/static/MoltenVK.xcframework ios/MoltenVK
-
 The Old iOS Build Instructions
 ==============================
 
@@ -41,11 +34,9 @@ Change directory to the newly created ppsspp directory and run:
 
     git submodule update --init
 
-The above command will pull in the submodules required by PPSSPP, including the native, ffmpeg, and lang directories.  Included in the ffmpeg directory should be the necessary libs and includes for ffmpeg, so most people can skip the next command.  However, if you need to recompile ffmpeg for some reason, change directory into ffmpeg and run (this will take a while):
+The above command will pull in the submodules required by PPSSPP, such as the lang directory. FFmpeg is built as part of PPSSPP, from ext/ffmpeg.
 
-    ./ios-build.sh
-
-Change directory back up to the main ppsspp directory and do the following:
+Then do the following:
 
     mkdir build-ios
     cd build-ios

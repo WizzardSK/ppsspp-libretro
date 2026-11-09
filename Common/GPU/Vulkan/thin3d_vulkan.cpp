@@ -174,7 +174,6 @@ public:
 VkShaderStageFlagBits StageToVulkan(ShaderStage stage) {
 	switch (stage) {
 	case ShaderStage::Vertex: return VK_SHADER_STAGE_VERTEX_BIT;
-	case ShaderStage::Geometry: return VK_SHADER_STAGE_GEOMETRY_BIT;
 	case ShaderStage::Compute: return VK_SHADER_STAGE_COMPUTE_BIT;
 	case ShaderStage::Fragment: return VK_SHADER_STAGE_FRAGMENT_BIT;
 	}
@@ -220,7 +219,7 @@ bool VKShaderModule::Compile(VulkanContext *vulkan, const uint8_t *data, size_t 
 	source_ = (const char *)data;
 	std::vector<uint32_t> spirv;
 	std::string errorMessage;
-	if (!GLSLtoSPV(vkstage_, source_.c_str(), GLSLVariant::VULKAN, spirv, &errorMessage)) {
+	if (!GLSLtoSPV(vkstage_, source_.c_str(), GLSLVariant::VULKAN, spirv, &errorMessage, &g_spirvCache)) {
 		WARN_LOG(Log::G3D, "Shader compile to module failed (%s): %s", tag_.c_str(), errorMessage.c_str());
 		return false;
 	}
@@ -333,6 +332,7 @@ public:
 	}
 	bool Create(VkCommandBuffer cmd, VulkanBarrierBatch *postBarriers, VulkanPushPool *pushBuffer, const TextureDesc &desc);
 	void Update(VkCommandBuffer cmd, VulkanBarrierBatch *postBarriers, VulkanPushPool *pushBuffer, const uint8_t *const *data, TextureCallback callback, int numLevels);
+	void UpdateRegions(VkCommandBuffer cmd, VulkanBarrierBatch *postBarriers, VulkanPushPool *pushBuffer, int level, const TextureRegionUpdate *regions, int numRegions);
 
 	~VKTexture() {
 		Destroy();
@@ -450,15 +450,21 @@ public:
 
 	void UpdateBuffer(Buffer *buffer, const uint8_t *data, size_t offset, size_t size, UpdateBufferFlags flags) override;
 	void UpdateTextureLevels(Texture *texture, const uint8_t **data, TextureCallback initDataCallback, int numLevels) override;
+	void UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) override;
 
 	void CopyFramebufferImage(Framebuffer *src, int level, int x, int y, int z, Framebuffer *dst, int dstLevel, int dstX, int dstY, int dstZ, int width, int height, int depth, Aspect aspects, const char *tag) override;
 	bool BlitFramebuffer(Framebuffer *src, int srcX1, int srcY1, int srcX2, int srcY2, Framebuffer *dst, int dstX1, int dstY1, int dstX2, int dstY2, Aspect aspects, FBBlitFilter filter, const char *tag) override;
 	bool CopyFramebufferToMemory(Framebuffer *src, Aspect aspects, int x, int y, int w, int h, Draw::DataFormat format, void *pixels, int pixelStride, ReadbackMode mode, const char *tag) override;
 	DataFormat PreferredFramebufferReadbackFormat(Framebuffer *src) override;
 
+	Swapchain *CreateSwapchain(const SwapchainDesc &desc, std::string *error) override;
+	void DestroySwapchain(Swapchain *swapchain) override;
+	void ResizeSwapchain(Swapchain *swapchain, int width, int height) override;
+
 	// These functions should be self explanatory.
 	void BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) override;
 	void BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect channelBit, int layer) override;
+	void BindFramebufferSamplesAsTexture(Framebuffer *fbo, int binding, int layer) override;
 
 	void GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) override;
 
@@ -743,7 +749,7 @@ VulkanTexture *VKContext::GetNullTexture() {
 		TextureCopyBatch batch;
 		nullTexture_->CopyBufferToMipLevel(cmdInit, &batch, 0, w, h, 0, bindBuf, bindOffset, w);
 		nullTexture_->FinishCopyBatch(cmdInit, &batch);
-		nullTexture_->EndCreate(cmdInit, false, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		nullTexture_->EndCreate(cmdInit, VK_PIPELINE_STAGE_TRANSFER_BIT);
 	}
 	return nullTexture_;
 }
@@ -849,7 +855,7 @@ bool VKTexture::Create(VkCommandBuffer cmd, VulkanBarrierBatch *postBarriers, Vu
 			layout = VK_IMAGE_LAYOUT_GENERAL;
 		}
 	}
-	vkTex_->EndCreate(cmd, false, VK_PIPELINE_STAGE_TRANSFER_BIT, layout);
+	vkTex_->EndCreate(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, layout);
 	return true;
 }
 
@@ -859,6 +865,37 @@ void VKTexture::Update(VkCommandBuffer cmd, VulkanBarrierBatch *postBarriers, Vu
 	vkTex_->PrepareForTransferDst(cmd, numLevels);
 	UpdateInternal(cmd, pushBuffer, data, initDataCallback, numLevels);
 	vkTex_->RestoreAfterTransferDst(numLevels, postBarriers);
+}
+
+void VKTexture::UpdateRegions(VkCommandBuffer cmd, VulkanBarrierBatch *postBarriers, VulkanPushPool *pushBuffer, int level, const TextureRegionUpdate *regions, int numRegions) {
+	VkFormat vulkanFormat = DataFormatToVulkan(format_);
+	int bpp = GetBpp(vulkanFormat);
+	_dbg_assert_(bpp != 0);
+	const int bytesPerPixel = bpp / 8;
+
+	// Only the level we're writing needs to change layout, the others stay sampleable.
+	vkTex_->PrepareForTransferDst(cmd, level + 1);
+
+	TextureCopyBatch batch;
+	batch.reserve(numRegions);
+	for (int i = 0; i < numRegions; i++) {
+		const TextureRegionUpdate &region = regions[i];
+		_dbg_assert_(region.w > 0 && region.h > 0);
+		const int srcStride = region.byteStride ? region.byteStride : region.w * bytesPerPixel;
+		const int dstStride = region.w * bytesPerPixel;
+
+		uint32_t offset;
+		VkBuffer buf;
+		uint8_t *dest = (uint8_t *)pushBuffer->Allocate((size_t)dstStride * region.h, 16, &buf, &offset);
+		_assert_(dest != nullptr);
+		for (int y = 0; y < region.h; y++) {
+			memcpy(dest + (size_t)dstStride * y, region.data + (size_t)srcStride * y, dstStride);
+		}
+		vkTex_->CopyBufferToMipLevelRegion(cmd, &batch, level, region.x, region.y, region.w, region.h, 0, buf, offset, region.w);
+	}
+	vkTex_->FinishCopyBatch(cmd, &batch);
+
+	vkTex_->RestoreAfterTransferDst(level + 1, postBarriers);
 }
 
 void VKTexture::UpdateInternal(VkCommandBuffer cmd, VulkanPushPool *pushBuffer, const uint8_t * const *data, TextureCallback initDataCallback, int numLevels) {
@@ -924,7 +961,6 @@ VKContext::VKContext(VulkanContext *vulkan, bool useRenderThread)
 	caps_.coordConvention = CoordConvention::Vulkan;
 	caps_.setMaxFrameLatencySupported = true;
 	caps_.anisoSupported = vulkan->GetDeviceFeatures().enabled.standard.samplerAnisotropy != 0;
-	caps_.tesselationShaderSupported = vulkan->GetDeviceFeatures().enabled.standard.tessellationShader != 0;
 	caps_.dualSourceBlend = vulkan->GetDeviceFeatures().enabled.standard.dualSrcBlend != 0;
 	caps_.depthClampSupported = vulkan->GetDeviceFeatures().enabled.standard.depthClamp != 0;
 
@@ -941,7 +977,8 @@ VKContext::VKContext(VulkanContext *vulkan, bool useRenderThread)
 	caps_.framebufferDepthBlitSupported = vulkan->GetDeviceInfo().canBlitToPreferredDepthStencilFormat;
 	caps_.framebufferStencilBlitSupported = caps_.framebufferDepthBlitSupported;
 	caps_.framebufferDepthCopySupported = true;   // Will pretty much always be the case.
-	caps_.framebufferSeparateDepthCopySupported = true;   // Will pretty much always be the case.
+	caps_.framebufferSeparateDepthCopySupported = true;
+	caps_.framebufferSampleReadSupported = true;   // Will pretty much always be the case.
 	// This doesn't affect what depth/stencil format is actually used, see VulkanQueueRunner.
 	caps_.preferredDepthBufferFormat = DataFormatFromVulkanDepth(vulkan->GetDeviceInfo().preferredDepthStencilFormat);
 	caps_.texture3DSupported = true;
@@ -955,6 +992,9 @@ VKContext::VKContext(VulkanContext *vulkan, bool useRenderThread)
 	caps_.sampleRateShadingSupported = vulkan->GetDeviceFeatures().enabled.standard.sampleRateShading != 0;
 	caps_.textureSwizzleSupported = true;
 	caps_.samplerLodControl = true;
+	if (vulkan->Extensions().KHR_portability_subset) {
+		caps_.samplerLodBias = vulkan->GetDeviceFeatures().available.portabilitySubset.samplerMipLodBias;
+	}
 
 	// Note that it must also be enabled on the pipelines (which we do).
 	caps_.provokingVertexLast = vulkan->GetDeviceFeatures().enabled.provokingVertex.provokingVertexLast;
@@ -964,6 +1004,8 @@ VKContext::VKContext(VulkanContext *vulkan, bool useRenderThread)
 	caps_.presentMaxInterval = 1;
 	caps_.presentInstantModeChange = false;  // TODO: Fix this with some work in VulkanContext
 	caps_.presentModesSupported = (PresentMode)0;
+	// Additional swapchains go with a real main one.
+	caps_.multipleSwapchains = vulkan->GetPresentation() == nullptr;
 
 	if (vulkan->GetPresentation()) {
 		// No real present modes exist in this model (the host, e.g. libretro, owns real presentation
@@ -1098,6 +1140,15 @@ VKContext::VKContext(VulkanContext *vulkan, bool useRenderThread)
 	} else if (caps_.vendor == GPUVendor::VENDOR_IMGTEC) {
 		// Not sure about driver versions, so let's just ban, impact is tiny.
 		bugs_.Infest(Bugs::PVR_BAD_16BIT_TEXFORMATS);
+		// At draw time, the driver writes the address of every dynamic UBO in the bound descriptor set into a
+		// table it sized for the ones the shader stage uses, so a stage that skips one runs off the end of it.
+		// Seen on a BXM-8-256 (Moto G54): a page fault in vkCmdDrawIndexed every few seconds in F1 2009.
+		bugs_.Infest(Bugs::PVR_UNUSED_DYNAMIC_UBO_OVERRUN);
+		// A shader that writes both clip and cull distances doesn't get culled (either one alone works), so
+		// geometry the PSP culls gets drawn. Seen on a BXM-8-256 (Moto G54) in DBZ Tenkaichi Tag Team and
+		// Monster Hunter 3rd. Without cull distances, draws reaching past the Z planes get clipped and culled on
+		// the CPU instead.
+		caps_.maxCullDistances = 0;
 	}
 
 	if (!vulkan->Extensions().KHR_depth_stencil_resolve) {
@@ -1269,13 +1320,13 @@ Pipeline *VKContext::CreateGraphicsPipeline(const PipelineDesc &desc, const char
 	_dbg_assert_((int)input->attributes.size() == (int)input->visc.vertexAttributeDescriptionCount);
 
 	pipeline->stride = input->binding.stride;
-	gDesc.ibd = input->binding;
+	gDesc.ibd[0] = input->binding;
 	for (size_t i = 0; i < input->attributes.size(); i++) {
 		gDesc.attrs[i] = input->attributes[i];
 	}
 	gDesc.vis.vertexAttributeDescriptionCount = input->visc.vertexAttributeDescriptionCount;
 	gDesc.vis.vertexBindingDescriptionCount = input->visc.vertexBindingDescriptionCount;
-	gDesc.vis.pVertexBindingDescriptions = &gDesc.ibd;
+	gDesc.vis.pVertexBindingDescriptions = gDesc.ibd;
 	gDesc.vis.pVertexAttributeDescriptions = gDesc.attrs;
 
 	gDesc.blend0 = blend->attachments[0];
@@ -1338,8 +1389,7 @@ void VKContext::SetViewport(const Viewport &viewport) {
 }
 
 void VKContext::SetBlendFactor(float color[4]) {
-	uint32_t col = Float4ToUint8x4(color);
-	renderManager_.SetBlendFactor(col);
+	renderManager_.SetBlendFactor(color);
 }
 
 void VKContext::SetStencilParams(uint8_t refValue, uint8_t writeMask, uint8_t compareMask) {
@@ -1400,6 +1450,23 @@ void VKContext::UpdateTextureLevels(Texture *texture, const uint8_t **data, Text
 
 	_dbg_assert_(numLevels <= tex->NumLevels());
 	tex->Update(initCmd, &renderManager_.PostInitBarrier(), push_, data, initDataCallback, numLevels);
+}
+
+void VKContext::UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) {
+	if (numRegions <= 0) {
+		return;
+	}
+	VkCommandBuffer initCmd = renderManager_.GetInitCmd();
+	if (!push_ || !initCmd) {
+		// Too early! Fail.
+		ERROR_LOG(Log::G3D, "Can't update textures before the first frame has started.");
+		return;
+	}
+
+	VKTexture *tex = (VKTexture *)texture;
+
+	_dbg_assert_(level < tex->NumLevels());
+	tex->UpdateRegions(initCmd, &renderManager_.PostInitBarrier(), push_, level, regions, numRegions);
 }
 
 static inline void CopySide(VkStencilOpState &dest, const StencilSetup &src) {
@@ -1778,6 +1845,24 @@ uint32_t VKContext::GetDataFormatSupport(DataFormat fmt) const {
 // It also has a reference to the command buffer that it was last rendered to with.
 // If it needs to be transitioned, and the frame number matches, use it, otherwise
 // use this frame's init command buffer.
+class VKSwapchain : public Swapchain {
+public:
+	VKSwapchain(VKRSwapchain *swapchain, const char *tag) : swapchain(swapchain), tag_(tag ? tag : "") {
+		UpdateSize();
+	}
+	// The render manager recreates it when it's out of date, possibly at another size.
+	void UpdateSize() {
+		width_ = swapchain->extent.width;
+		height_ = swapchain->extent.height;
+	}
+	const char *Tag() const override { return tag_.c_str(); }
+
+	VKRSwapchain *swapchain;
+
+private:
+	std::string tag_;
+};
+
 class VKFramebuffer : public Framebuffer {
 public:
 	VKFramebuffer(VKRFramebuffer *fb, int multiSampleLevel) : buf_(fb) {
@@ -1786,6 +1871,7 @@ public:
 		height_ = fb->height;
 		layers_ = fb->numLayers;
 		multiSampleLevel_ = multiSampleLevel;
+		hasDepthStencil_ = fb->HasDepth();
 	}
 	~VKFramebuffer() {
 		_assert_msg_(buf_, "Null buf_ in VKFramebuffer - double delete?");
@@ -1841,7 +1927,16 @@ bool VKContext::BlitFramebuffer(Framebuffer *srcfb, int srcX1, int srcY1, int sr
 }
 
 bool VKContext::CopyFramebufferToMemory(Framebuffer *srcfb, Aspect aspects, int x, int y, int w, int h, Draw::DataFormat format, void *pixels, int pixelStride, ReadbackMode mode, const char *tag) {
+	srcfb = PrimaryToNull(srcfb);
+	if (srcfb && srcfb->IsSwapchain()) {
+		// Not supported for additional swapchains.
+		return false;
+	}
 	VKFramebuffer *src = (VKFramebuffer *)srcfb;
+	if (!src && vulkan_->GetSwapchain() == VK_NULL_HANDLE) {
+		// No backbuffer to read, as in headless.
+		return false;
+	}
 
 	int aspectMask = 0;
 	if (aspects & Aspect::COLOR_BIT) aspectMask |= VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1852,6 +1947,7 @@ bool VKContext::CopyFramebufferToMemory(Framebuffer *srcfb, Aspect aspects, int 
 }
 
 DataFormat VKContext::PreferredFramebufferReadbackFormat(Framebuffer *src) {
+	src = PrimaryToNull(src);
 	if (src) {
 		return DrawContext::PreferredFramebufferReadbackFormat(src);
 	}
@@ -1863,18 +1959,29 @@ DataFormat VKContext::PreferredFramebufferReadbackFormat(Framebuffer *src) {
 }
 
 void VKContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) {
+	fbo = PrimaryToNull(fbo);
 	_dbg_assert_(fbo != nullptr || equals(tag, "BackBuffer"))
 
-	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 	VKRRenderPassLoadAction color = (VKRRenderPassLoadAction)rp.color;
 	VKRRenderPassLoadAction depth = (VKRRenderPassLoadAction)rp.depth;
 	VKRRenderPassLoadAction stencil = (VKRRenderPassLoadAction)rp.stencil;
+
+	if (fbo && fbo->IsSwapchain()) {
+		VKSwapchain *swapchain = (VKSwapchain *)fbo;
+		swapchain->UpdateSize();
+		renderManager_.BindFramebufferAsRenderTarget(nullptr, color, depth, stencil, rp.clearColor, rp.clearDepth, rp.clearStencil, tag, swapchain->swapchain);
+		curFramebuffer_ = nullptr;
+		return;
+	}
+
+	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 
 	renderManager_.BindFramebufferAsRenderTarget(fb ? fb->GetFB() : nullptr, color, depth, stencil, rp.clearColor, rp.clearDepth, rp.clearStencil, tag);
 	curFramebuffer_ = fb;
 }
 
 void VKContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect channelBit, int layer) {
+	_dbg_assert_(fbo && !fbo->IsSwapchain());
 	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 	_assert_(binding >= 0 && binding < MAX_BOUND_TEXTURES);
 
@@ -1900,7 +2007,23 @@ void VKContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect c
 	boundImageView_[binding] = renderManager_.BindFramebufferAsTexture(fb->GetFB(), binding, aspect, layer);
 }
 
+void VKContext::BindFramebufferSamplesAsTexture(Framebuffer *fbo, int binding, int layer) {
+	_dbg_assert_(fbo && !fbo->IsSwapchain());
+	VKFramebuffer *fb = (VKFramebuffer *)fbo;
+	_assert_(binding >= 0 && binding < MAX_BOUND_TEXTURES);
+	_assert_(fb != curFramebuffer_);
+	boundTextures_[binding].reset(nullptr);
+	boundImageView_[binding] = renderManager_.BindFramebufferAsTexture(fb->GetFB(), binding, VK_IMAGE_ASPECT_COLOR_BIT, layer, true);
+}
+
 void VKContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) {
+	fbo = PrimaryToNull(fbo);
+	if (fbo && fbo->IsSwapchain()) {
+		const VKRSwapchain *swapchain = ((VKSwapchain *)fbo)->swapchain;
+		*w = swapchain->extent.width;
+		*h = swapchain->extent.height;
+		return;
+	}
 	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 	if (fb) {
 		*w = fb->GetFB()->width;
@@ -1911,6 +2034,30 @@ void VKContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) {
 	}
 }
 
+Swapchain *VKContext::CreateSwapchain(const SwapchainDesc &desc, std::string *error) {
+	VKRSwapchain *swapchain = renderManager_.CreateExtraSwapchain(desc.winsys, desc.data1, desc.data2, desc.width, desc.height, error);
+	return swapchain ? new VKSwapchain(swapchain, desc.tag) : nullptr;
+}
+
+void VKContext::DestroySwapchain(Swapchain *swapchain) {
+	_dbg_assert_(swapchain && swapchain != primarySwapchain_);
+	VKSwapchain *vkSwapchain = (VKSwapchain *)swapchain;
+	renderManager_.DestroyExtraSwapchain(vkSwapchain->swapchain);
+	vkSwapchain->swapchain = nullptr;
+	// Nothing else may hold it, it no longer has a swapchain to be.
+	vkSwapchain->ReleaseAssertLast();
+}
+
+void VKContext::ResizeSwapchain(Swapchain *swapchain, int width, int height) {
+	if (swapchain == primarySwapchain_) {
+		// Goes through GraphicsContext::Resize.
+		return;
+	}
+	VKSwapchain *vkSwapchain = (VKSwapchain *)swapchain;
+	renderManager_.ResizeExtraSwapchain(vkSwapchain->swapchain, width, height);
+	vkSwapchain->UpdateSize();
+}
+
 void VKContext::HandleEvent(Event ev, int width, int height, void *param1, void *param2) {
 	switch (ev) {
 	case Event::LOST_BACKBUFFER:
@@ -1918,6 +2065,7 @@ void VKContext::HandleEvent(Event ev, int width, int height, void *param1, void 
 		break;
 	case Event::GOT_BACKBUFFER:
 		renderManager_.CreateBackbuffers();
+		primarySwapchain_->SetSize(vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight());
 		break;
 	default:
 		_assert_(false);

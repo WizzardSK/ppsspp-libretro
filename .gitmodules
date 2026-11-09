@@ -4,9 +4,6 @@
 [submodule "pspautotests"]
 	path = pspautotests
 	url = https://github.com/hrydgard/pspautotests.git
-[submodule "ffmpeg"]
-	path = ffmpeg
-	url = https://github.com/hrydgard/ppsspp-ffmpeg.git
 [submodule "ext/armips"]
 	path = ext/armips
 	url = https://github.com/Kingcom/armips.git
@@ -28,9 +25,6 @@
 [submodule "zstd"]
 	path = ext/zstd
 	url = https://github.com/facebook/zstd.git
-[submodule "SDL/macOS"]
-	path = SDL/macOS
-	url = https://github.com/hrydgard/ppsspp-mac-sdl
 [submodule "ppsspp-debugger"]
 	path = assets/debugger
 	url = https://github.com/unknownbrackets/ppsspp-debugger.git
@@ -41,9 +35,6 @@
 [submodule "ext/rcheevos"]
 	path = ext/rcheevos
 	url = https://github.com/RetroAchievements/rcheevos.git
-[submodule "ext/naett"]
-	path = ext/naett
-	url = https://github.com/erkkah/naett.git
 [submodule "ext/libchdr"]
 	path = ext/libchdr
 	url = https://github.com/rtissera/libchdr.git
@@ -53,9 +44,6 @@
 [submodule "ext/OpenXR-SDK"]
 	path = ext/OpenXR-SDK
 	url = https://github.com/KhronosGroup/OpenXR-SDK.git
-[submodule "ios/MoltenVK"]
-	path = ios/MoltenVK
-	url = https://github.com/hrydgard/ppsspp-moltenvk.git
 [submodule "ext/lua"]
 	path = ext/lua
 	url = https://github.com/hrydgard/ppsspp-lua.git
@@ -72,3 +60,6 @@
 [submodule "frametests"]
 	path = frametests
 	url = https://github.com/hrydgard/ppsspp-frametest-ci.git
+[submodule "ext/oboe"]
+	path = ext/oboe
+	url = https://github.com/google/oboe.git

@@ -4,6 +4,7 @@
 #include <cfloat>
 #include <vector>
 #include <string>
+#include "Common/CommonWindows.h"
 #include <d3d11.h>
 #include <D3Dcompiler.h>
 
@@ -72,11 +73,11 @@ HRESULT CreateVertexShaderD3D11(ID3D11Device *device, const char *code, size_t c
 		if (!errorMessage.empty()) {
 			ERROR_LOG(Log::G3D, "%s", errorMessage.c_str());
 		}
-		return S_FALSE;
+		return E_FAIL;
 	}
 
 	auto hr = device->CreateVertexShader(byteCode.data(), byteCode.size(), nullptr, ppVertexShader);
-	if (byteCodeOut)
+	if (SUCCEEDED(hr) && byteCodeOut)
 		*byteCodeOut = byteCode;
 	return hr;
 }
@@ -91,7 +92,7 @@ HRESULT CreatePixelShaderD3D11(ID3D11Device *device, const char *code, size_t co
 		if (!errorMessage.empty()) {
 			ERROR_LOG(Log::G3D, "%s", errorMessage.c_str());
 		}
-		return S_FALSE;
+		return E_FAIL;
 	}
 
 	return device->CreatePixelShader(byteCode.data(), byteCode.size(), nullptr, ppPixelShader);
@@ -101,32 +102,15 @@ HRESULT CreateComputeShaderD3D11(ID3D11Device *device, const char *code, size_t 
 	if (ppComputeShader)
 		*ppComputeShader = nullptr;
 	if (featureLevel <= D3D_FEATURE_LEVEL_9_3)
-		return S_FALSE;
+		return E_FAIL;
 	std::string errorMessage;
 	std::vector<uint8_t> byteCode = CompileShaderToBytecodeD3D11(code, codeSize, "cs_4_0", flags, &errorMessage);
 	if (byteCode.empty()) {
 		if (!errorMessage.empty()) {
 			ERROR_LOG(Log::G3D, "%s", errorMessage.c_str());
 		}
-		return S_FALSE;
+		return E_FAIL;
 	}
 
 	return device->CreateComputeShader(byteCode.data(), byteCode.size(), nullptr, ppComputeShader);
-}
-
-HRESULT CreateGeometryShaderD3D11(ID3D11Device *device, const char *code, size_t codeSize, D3D_FEATURE_LEVEL featureLevel, UINT flags, ID3D11GeometryShader **ppGeometryShader) {
-	if (ppGeometryShader)
-		*ppGeometryShader = nullptr;
-	if (featureLevel <= D3D_FEATURE_LEVEL_9_3)
-		return S_FALSE;
-	std::string errorMessage;
-	std::vector<uint8_t> byteCode = CompileShaderToBytecodeD3D11(code, codeSize, "gs_5_0", flags, &errorMessage);
-	if (byteCode.empty()) {
-		if (!errorMessage.empty()) {
-			ERROR_LOG(Log::G3D, "%s", errorMessage.c_str());
-		}
-		return S_FALSE;
-	}
-
-	return device->CreateGeometryShader(byteCode.data(), byteCode.size(), nullptr, ppGeometryShader);
 }

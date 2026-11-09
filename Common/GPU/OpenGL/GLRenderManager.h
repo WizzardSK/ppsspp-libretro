@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +31,8 @@ constexpr int MAX_GL_TEXTURE_SLOTS = 8;
 
 class GLRTexture {
 public:
+	GLRTexture(const GLRTexture &) = delete;
+	GLRTexture &operator=(const GLRTexture &) = delete;
 	GLRTexture(const Draw::DeviceCaps &caps, int width, int height, int depth, int numMips);
 	~GLRTexture();
 
@@ -53,6 +56,8 @@ public:
 
 class GLRFramebuffer {
 public:
+	GLRFramebuffer(const GLRFramebuffer &) = delete;
+	GLRFramebuffer &operator=(const GLRFramebuffer &) = delete;
 	GLRFramebuffer(const Draw::DeviceCaps &caps, int _width, int _height, bool z_stencil, const char *tag)
 		: color_texture(caps, _width, _height, 1, 1), z_stencil_texture(caps, _width, _height, 1, 1),
 		width(_width), height(_height), z_stencil_(z_stencil) {
@@ -73,6 +78,10 @@ public:
 	int height;
 	GLuint colorDepth = 0;
 	bool z_stencil_;
+#ifdef __LIBRETRO__
+	GLRFramebuffer *vrRight = nullptr;
+	unsigned vrGeneration = 0;
+#endif
 
 private:
 	std::string tag_;
@@ -83,6 +92,8 @@ private:
 
 class GLRShader {
 public:
+	GLRShader(const GLRShader &) = delete;
+	GLRShader &operator=(const GLRShader &) = delete;
 	explicit GLRShader(std::string_view _desc) : desc(_desc) {}
 	~GLRShader() {
 		if (shader) {
@@ -116,6 +127,9 @@ public:
 
 class GLRProgram {
 public:
+	GLRProgram() = default;
+	GLRProgram(const GLRProgram &) = delete;
+	GLRProgram &operator=(const GLRProgram &) = delete;
 	~GLRProgram() {
 		if (deleteCallback_) {
 			deleteCallback_(deleteParam_);
@@ -190,9 +204,12 @@ public:
 		GLenum type;
 		GLboolean normalized;
 		intptr_t offset;
+		// 1: from the draw's second vertex buffer, with stride1.
+		int stream = 0;
 	};
 	std::vector<Entry> entries;
 	int stride;
+	int stride1 = 0;
 	int semanticsMask_ = 0;
 };
 
@@ -239,6 +256,11 @@ public:
 	void ThreadStart(Draw::DrawContext *draw);
 	void ThreadEnd();
 	bool ThreadFrame();  // False means it's time to exit.
+	// True if ThreadFrame() has queued work and will not block on an empty queue.
+	bool HasQueuedThreadWork() {
+		std::lock_guard<std::mutex> lock(pushMutex_);
+		return !renderThreadQueue_.empty();
+	}
 
 	void NotifyEmuThreadExit();
 
@@ -263,6 +285,7 @@ public:
 	// and then we'll also need formats and stuff.
 	GLRTexture *CreateTexture(GLenum target, int width, int height, int depth, int numMips) {
 		_dbg_assert_(target != 0);
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::CREATE_TEXTURE;
 		step.create_texture.texture = new GLRTexture(caps_, width, height, depth, numMips);
@@ -271,6 +294,7 @@ public:
 	}
 
 	GLRBuffer *CreateBuffer(GLuint target, size_t size, GLuint usage) {
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::CREATE_BUFFER;
 		step.create_buffer.buffer = new GLRBuffer(target, size);
@@ -280,6 +304,7 @@ public:
 	}
 
 	GLRShader *CreateShader(GLuint stage, const std::string &code, std::string_view desc) {
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::CREATE_SHADER;
 		step.create_shader.shader = new GLRShader(desc);
@@ -292,6 +317,7 @@ public:
 	GLRFramebuffer *CreateFramebuffer(int width, int height, bool z_stencil, const char *tag) {
 		_dbg_assert_(width > 0 && height > 0 && tag != nullptr);
 
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::CREATE_FRAMEBUFFER;
 		step.create_framebuffer.framebuffer = new GLRFramebuffer(caps_, width, height, z_stencil, tag);
@@ -303,6 +329,7 @@ public:
 	GLRProgram *CreateProgram(
 		std::vector<GLRShader *> shaders, std::vector<GLRProgram::Semantic> semantics, std::vector<GLRProgram::UniformLocQuery> queries,
 		std::vector<GLRProgram::Initializer> initializers, GLRProgramLocData *locData, const GLRProgramFlags &flags) {
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::CREATE_PROGRAM;
 		_assert_(shaders.size() <= ARRAY_SIZE(step.create_program.shaders));
@@ -331,12 +358,14 @@ public:
 		return step.create_program.program;
 	}
 
-	GLRInputLayout *CreateInputLayout(const std::vector<GLRInputLayout::Entry> &entries, int stride) {
+	GLRInputLayout *CreateInputLayout(const std::vector<GLRInputLayout::Entry> &entries, int stride, int stride1 = 0) {
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::CREATE_INPUT_LAYOUT;
 		step.create_input_layout.inputLayout = new GLRInputLayout();
 		step.create_input_layout.inputLayout->entries = entries;
 		step.create_input_layout.inputLayout->stride = stride;
+		step.create_input_layout.inputLayout->stride1 = stride1;
 		for (auto &iter : step.create_input_layout.inputLayout->entries) {
 			step.create_input_layout.inputLayout->semanticsMask_ |= 1 << iter.location;
 		}
@@ -411,6 +440,7 @@ public:
 	void BufferSubdata(GLRBuffer *buffer, size_t offset, size_t size, uint8_t *data, bool deleteData = true) {
 		// TODO: Maybe should be a render command instead of an init command? When possible it's better as
 		// an init command, that's for sure.
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::BUFFER_SUBDATA;
 		_dbg_assert_(offset <= buffer->size_ - size);
@@ -423,6 +453,7 @@ public:
 
 	// Takes ownership over the data pointer and delete[]-s it.
 	void TextureImage(GLRTexture *texture, int level, int width, int height, int depth, Draw::DataFormat format, uint8_t *data, GLRAllocType allocType = GLRAllocType::NEW, bool linearFilter = false) {
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::TEXTURE_IMAGE;
 		step.texture_image.texture = texture;
@@ -434,6 +465,23 @@ public:
 		step.texture_image.depth = depth;
 		step.texture_image.allocType = allocType;
 		step.texture_image.linearFilter = linearFilter;
+	}
+
+	// Takes ownership over the data pointer and delete[]-s it. Runs as an init step, so unlike
+	// TextureSubImage below, it doesn't have to happen inside a render pass.
+	void TextureSubImageInit(GLRTexture *texture, int level, int x, int y, int width, int height, Draw::DataFormat format, uint8_t *data, GLRAllocType allocType = GLRAllocType::NEW) {
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
+		GLRInitStep &step = initSteps_.push_uninitialized();
+		step.stepType = GLRInitStepType::TEXTURE_SUBIMAGE;
+		step.texture_subimage.texture = texture;
+		step.texture_subimage.data = data;
+		step.texture_subimage.format = format;
+		step.texture_subimage.level = level;
+		step.texture_subimage.x = x;
+		step.texture_subimage.y = y;
+		step.texture_subimage.width = width;
+		step.texture_subimage.height = height;
+		step.texture_subimage.allocType = allocType;
 	}
 
 	void TextureSubImage(int slot, GLRTexture *texture, int level, int x, int y, int width, int height, Draw::DataFormat format, uint8_t *data, GLRAllocType allocType = GLRAllocType::NEW) {
@@ -453,6 +501,7 @@ public:
 	}
 
 	void FinalizeTexture(GLRTexture *texture, int loadedLevels, bool genMips) {
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
 		GLRInitStep &step = initSteps_.push_uninitialized();
 		step.stepType = GLRInitStepType::TEXTURE_FINALIZE;
 		step.texture_finalize.texture = texture;
@@ -753,13 +802,16 @@ public:
 		data.clear.scissorH = scissorH;
 	}
 
-	void Draw(GLRInputLayout *inputLayout, GLRBuffer *vertexBuffer, uint32_t vertexOffset, GLenum mode, int first, int count) {
+	// vertexBuffer1 is for the input layout's stream 1 entries, if it has any.
+	void Draw(GLRInputLayout *inputLayout, GLRBuffer *vertexBuffer, uint32_t vertexOffset, GLenum mode, int first, int count, GLRBuffer *vertexBuffer1 = nullptr, uint32_t vertexOffset1 = 0) {
 		_dbg_assert_(vertexBuffer && curRenderStep_ && curRenderStep_->stepType == GLRStepType::RENDER);
 		GLRRenderData &data = curRenderStep_->commands.push_uninitialized();
 		data.cmd = GLRRenderCommand::DRAW;
 		data.draw.inputLayout = inputLayout;
 		data.draw.vertexOffset = vertexOffset;
 		data.draw.vertexBuffer = vertexBuffer;
+		data.draw.vertexBuffer1 = vertexBuffer1;
+		data.draw.vertexOffset1 = vertexOffset1;
 		data.draw.indexBuffer = nullptr;
 		data.draw.mode = mode;
 		data.draw.first = first;
@@ -768,19 +820,24 @@ public:
 	}
 
 	// Would really love to have a basevertex parameter, but impossible in unextended GLES, without glDrawElementsBaseVertex, unfortunately.
-	void DrawIndexed(GLRInputLayout *inputLayout, GLRBuffer *vertexBuffer, uint32_t vertexOffset, GLRBuffer *indexBuffer, uint32_t indexOffset, GLenum mode, int count, GLenum indexType, int instances = 1) {
+	// If maxIndex is known (>= 0), it's passed on to the driver through glDrawRangeElements, which saves drivers that need the index
+	// range (like Panfrost) from scanning the index data on the CPU for every draw.
+	void DrawIndexed(GLRInputLayout *inputLayout, GLRBuffer *vertexBuffer, uint32_t vertexOffset, GLRBuffer *indexBuffer, uint32_t indexOffset, GLenum mode, int count, GLenum indexType, int instances = 1, int maxIndex = -1, GLRBuffer *vertexBuffer1 = nullptr, uint32_t vertexOffset1 = 0) {
 		_dbg_assert_(vertexBuffer && indexBuffer && curRenderStep_ && curRenderStep_->stepType == GLRStepType::RENDER);
 		GLRRenderData &data = curRenderStep_->commands.push_uninitialized();
 		data.cmd = GLRRenderCommand::DRAW;
 		data.draw.inputLayout = inputLayout;
 		data.draw.vertexOffset = vertexOffset;
 		data.draw.vertexBuffer = vertexBuffer;
+		data.draw.vertexBuffer1 = vertexBuffer1;
+		data.draw.vertexOffset1 = vertexOffset1;
 		data.draw.indexBuffer = indexBuffer;
 		data.draw.indexOffset = indexOffset;
 		data.draw.mode = mode;
 		data.draw.count = count;
 		data.draw.indexType = indexType;
 		data.draw.instances = instances;
+		data.draw.maxIndex = maxIndex;
 	}
 
 	enum { MAX_INFLIGHT_FRAMES = 3 };
@@ -799,7 +856,12 @@ public:
 		queueRunner_.Resize(width, height);
 	}
 
+	void ForgetBoundFramebuffers() {
+		queueRunner_.ForgetBoundFramebuffers();
+	}
+
 	void UnregisterPushBuffer(GLPushBuffer *buffer) {
+		std::lock_guard<std::mutex> lock(pushBuffersMutex_);
 		int foundCount = 0;
 		for (int i = 0; i < MAX_INFLIGHT_FRAMES; i++) {
 			auto iter = frameData_[i].activePushBuffers.find(buffer);
@@ -831,12 +893,6 @@ public:
 		return queueRunner_.GetGLString(name);
 	}
 
-	// Used during Android-style ugly shutdown. No need to have a way to set it back because we'll be
-	// destroyed.
-	void SetSkipGLCalls() {
-		skipGLCalls_ = true;
-	}
-
 	int GetNumSteps() const {
 		return (int)steps_.size();
 	}
@@ -850,6 +906,7 @@ private:
 	// When using legacy functionality for push buffers (glBufferData), we need to flush them
 	// before actually making the glDraw* calls. It's best if the render manager handles that.
 	void RegisterPushBuffer(int frame, GLPushBuffer *buffer) {
+		std::lock_guard<std::mutex> lock(pushBuffersMutex_);
 		frameData_[frame].activePushBuffers.insert(buffer);
 	}
 
@@ -860,7 +917,17 @@ private:
 
 	GLRStep *curRenderStep_ = nullptr;
 	std::vector<GLRStep *> steps_;
+	// Guards initSteps_. Recorded into from the emu thread, but also from the loader thread during
+	// boot (InitGPU runs there, and GL has to record device object creation rather than just doing
+	// it), and moved out on the emu thread in Finish/FlushSync. Uncontended in practice.
+	// Lock ordering: taken while pushMutex_ is held, never the other way around.
+	std::mutex initStepsMutex_;
 	FastVec<GLRInitStep> initSteps_;
+
+	// Guards frameData_[].activePushBuffers, which is inserted into from whichever thread creates a
+	// push buffer, erased from on the render thread (GLDeleter), and walked on the render thread.
+	// Lock ordering: taken before initStepsMutex_ (Flush() below records init steps), never after.
+	std::mutex pushBuffersMutex_;
 
 	// Execution time state
 
@@ -880,7 +947,6 @@ private:
 	bool syncDone_ = false;
 
 	GLDeleter deleter_;
-	bool skipGLCalls_ = false;
 
 	int curFrame_ = 0;
 

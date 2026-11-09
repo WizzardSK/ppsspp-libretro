@@ -190,7 +190,12 @@ std::string GetTestName(const Path &bootFilename)
 }
 
 bool CompareOutput(const Path &bootFilename, const std::string &output, bool verbose, bool printEqualLines) {
-	Path expect_filename = bootFilename.GetFileExtension() == ".prx" ? bootFilename.WithReplacedExtension(".prx", ".expected") : bootFilename.WithExtraExtension(".expected");
+	// A .prx test has its expectations next to it as ".expected"; anything else just gets the
+	// extension tacked on.
+	Path expect_filename;
+	if (!bootFilename.WithReplacedExtension(".prx", ".expected", &expect_filename)) {
+		expect_filename = bootFilename.WithExtraExtension(".expected");
+	}
 	std::unique_ptr<FileLoader> expect_loader(ConstructFileLoader(expect_filename));
 
 	if (expect_loader->Exists()) {
@@ -398,6 +403,13 @@ double ScreenshotComparer::Compare(const Path &screenshotFilename) {
 				return -1.0f;
 			}
 
+			// Everything below reads w_ x h_ pixels from it.
+			if (width < (int)w_ || height < (int)h_) {
+				error_ = StringFromFormat("Screenshot is too small (%dx%d, expected %dx%d): %s", width, height, (int)w_, (int)h_, screenshotFilename.ToVisualString().c_str());
+				free(reference_);
+				reference_ = nullptr;
+				return -1.0f;
+			}
 			referenceStride_ = width;
 		}
 	} else {

@@ -16,16 +16,27 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <string_view>
+#include <thread>
 
 #include "zlib.h"
 
+#include "Common/Data/Text/I18n.h"
+#include "Common/File/DirListing.h"
 #include "Common/File/FileUtil.h"
 #include "Common/File/Path.h"
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
+#include "Common/System/OSD.h"
+#include "Common/Thread/ThreadUtil.h"
+#include "Core/Config.h"
 #include "Core/ELF/ParamSFO.h"
 #include "Core/ELF/PBPReader.h"
 #include "Core/ELF/PrxDecrypter.h"
@@ -36,9 +47,7 @@
 #include "Core/System.h"
 #include "Core/Util/PSARUnpack.h"
 
-extern "C" {
 #include "ext/libkirk/kirk_engine.h"
-}
 
 // A PSAR record is [header][entry], where the header is 0x150 bytes of PRX-style encryption
 // metadata and the entry is 0x110 bytes describing one file. Pre-decrypted archives (rare, and
@@ -334,6 +343,10 @@ const char *PSPModelGenerationToString(PSPModelGeneration generation) {
 	}
 }
 
+PSPModelGeneration EmulatedModelGeneration() {
+	return g_Config.iPSPModel == PSP_MODEL_FAT ? PSPModelGeneration::PSP_1000 : PSPModelGeneration::PSP_2000;
+}
+
 bool PSPModelGenerationFromString(std::string_view name, PSPModelGeneration *generation) {
 	if (equalsNoCase(name, "any")) {
 		*generation = PSPModelGeneration::Any;
@@ -486,9 +499,12 @@ public:
 	const std::string &firmwareVersion() const { return firmwareVersion_; }
 	const std::string &entryName() const { return entryName_; }
 	bool entryIsDirectory() const { return entryIsDirectory_; }
-	PSARCompression entryCompression() const { return entryCompression_; }
+	// Decrypting an entry's contents is by far the most expensive thing here, and an archive holds
+	// well over a thousand of them - so it doesn't happen until one of these two asks for it. An
+	// entry a filter rejects never gets decrypted at all.
+	PSARCompression entryCompression() { EnsureContents(); return entryCompression_; }
 	// Empty for a directory, or for an entry we couldn't decompress.
-	const std::vector<u8> &entryData() const { return entryData_; }
+	const std::vector<u8> &entryData() { EnsureContents(); return entryData_; }
 	// How far into the archive the next record starts, and where the records stop - i.e. progress.
 	u32 position() const { return pos_; }
 	size_t limit() const { return limit_; }
@@ -496,6 +512,8 @@ public:
 private:
 	// Decrypts one record into 'out'. Returns the decrypted size, or <= 0 on failure.
 	int DecodeBlock(u32 offset, u32 cbIn, std::vector<u8> &out);
+	// Decodes the current entry's contents, if that hasn't happened yet.
+	void EnsureContents();
 
 	const u8 *psar_;
 	size_t size_;
@@ -513,6 +531,13 @@ private:
 	bool entryIsDirectory_ = false;
 	PSARCompression entryCompression_ = PSARCompression::None;
 	std::vector<u8> entryData_;
+
+	// Where the current entry's contents live, for decoding them later. Records are decrypted
+	// independently of each other, so it doesn't matter that we've moved past them by then.
+	bool contentsDecoded_ = true;
+	u32 contentPos_ = 0;
+	u32 contentChunkSize_ = 0;
+	u32 contentExpandedSize_ = 0;
 
 	std::vector<u8> block_;
 	std::vector<u8> block2_;
@@ -571,9 +596,17 @@ bool PSARReader::Init(std::string *error) {
 	decrypted_ = ReadU32(psar_ + 0x20) == PSAR_DECRYPTED_MARKER;
 	overhead_ = decrypted_ ? 0 : PSAR_HEADER_SIZE;
 
+	// The header records how long the run of records is. Trusting it both stops us decoding
+	// trailing padding as an entry and, more importantly, catches a short archive: without this
+	// check a truncated one just looks like a smaller complete one, and unpacks to half a
+	// firmware that every stat reports as a clean install.
 	limit_ = size_;
 	const u32 declaredSize = ReadU32(psar_ + 8);
-	if (declaredSize >= 0x40 && declaredSize <= size_) {
+	if (declaredSize > size_) {
+		*error = StringFromFormat("Truncated archive: it declares %u bytes but only %u are here", declaredSize, (u32)size_);
+		return false;
+	}
+	if (declaredSize >= 0x40) {
 		limit_ = declaredSize;
 	}
 
@@ -586,7 +619,9 @@ bool PSARReader::Init(std::string *error) {
 		return false;
 	}
 
-	// The first block is a text record ending in the firmware version, e.g. "...,6.61".
+	// The first block is a text record ending in the firmware version, e.g. "...,6.61". In a version
+	// 1 archive it's only numbers (1.00's: the build, 106, and the record count, 214) and this finds
+	// no text, so UnpackPSAR() takes the version from the firmware's version.txt instead.
 	const char *text = (const char *)block_.data() + 0x10;
 	const size_t textLen = strnlen(text, PSAR_ENTRY_SIZE - 0x10);
 	const std::string_view firstLine(text, textLen);
@@ -607,8 +642,9 @@ bool PSARReader::Init(std::string *error) {
 
 	if (!oldschool_) {
 		// The second block's size isn't recorded anywhere, so try the ones real updaters use.
-		// 100 covers most, 2.7x is bigger, and some store it in the first block.
-		const u32 candidates[] = { 100, 144, ReadU16(block_.data() + 0x90) };
+		// 100 covers most, 2.7x is bigger, and some store it in the first block. That one is the
+		// unpadded size (408 in a 6.61 updater) and the block is padded to 16 bytes.
+		const u32 candidates[] = { 100, 144, (ReadU16(block_.data() + 0x90) + 15u) & ~15u };
 		decoded = -1;
 		for (u32 candidate : candidates) {
 			if (candidate == 0) {
@@ -634,6 +670,7 @@ int PSARReader::NextEntry(std::string *error) {
 	entryData_.clear();
 	entryIsDirectory_ = false;
 	entryCompression_ = PSARCompression::None;
+	contentsDecoded_ = true;  // Nothing to decode until we find out there's a payload.
 
 	// Stop when what's left can't hold another whole record. Both archives I've looked at end with
 	// a few bytes of padding that would otherwise be decoded as a truncated entry and reported as
@@ -661,6 +698,13 @@ int PSARReader::NextEntry(std::string *error) {
 
 	const u32 chunkSize = ReadU32(block_.data() + 0x104);
 	const u32 expandedSize = ReadU32(block_.data() + 0x108);
+	// pos_ is a u32, so a huge chunk would wrap it back to an earlier entry and loop forever.
+	// Check against the file, not limit_: the last entry's contents can run past the size the
+	// header declares (1.x updaters, and the 3.60, 4.21 and 5.70 PSARs).
+	if (chunkSize > size_ - std::min((size_t)pos_, size_)) {
+		*error = StringFromFormat("Entry '%s' runs past the end of the archive (%u bytes)", entryName_.c_str(), chunkSize);
+		return -1;
+	}
 
 	if (expandedSize == 0) {
 		entryIsDirectory_ = true;
@@ -668,28 +712,171 @@ int PSARReader::NextEntry(std::string *error) {
 		*error = StringFromFormat("Entry '%s' claims an unreasonable size (%u)", entryName_.c_str(), expandedSize);
 		return -1;
 	} else {
-		decoded = DecodeBlock(pos_, chunkSize, block2_);
-		if (decoded <= 0) {
-			WARN_LOG(Log::Loader, "PSAR: couldn't decrypt the contents of '%s'", entryName_.c_str());
-			entryCompression_ = PSARCompression::Unknown;
-		} else {
-			entryCompression_ = DetectCompression(block2_.data(), decoded);
-			if (entryCompression_ == PSARCompression::Zlib) {
-				entryData_.resize(expandedSize);
-				uLongf destLen = expandedSize;
-				const int zResult = uncompress(entryData_.data(), &destLen, block2_.data(), decoded);
-				if (zResult != Z_OK || destLen != expandedSize) {
-					WARN_LOG(Log::Loader, "PSAR: inflate failed for '%s' (%d)", entryName_.c_str(), zResult);
-					entryData_.clear();
-				}
-			}
-			// Anything else we leave empty - the caller reports it through the stats.
-		}
+		contentPos_ = pos_;
+		contentChunkSize_ = chunkSize;
+		contentExpandedSize_ = expandedSize;
+		contentsDecoded_ = false;
 	}
 
 	pos_ += chunkSize;
 	return 1;
 }
+
+void PSARReader::EnsureContents() {
+	if (contentsDecoded_) {
+		return;
+	}
+	contentsDecoded_ = true;
+
+	const int decoded = DecodeBlock(contentPos_, contentChunkSize_, block2_);
+	if (decoded <= 0) {
+		WARN_LOG(Log::Loader, "PSAR: couldn't decrypt the contents of '%s'", entryName_.c_str());
+		entryCompression_ = PSARCompression::Unknown;
+		return;
+	}
+
+	entryCompression_ = DetectCompression(block2_.data(), decoded);
+	if (entryCompression_ == PSARCompression::Zlib) {
+		entryData_.resize(contentExpandedSize_);
+		uLongf destLen = contentExpandedSize_;
+		uLong sourceLen = decoded;
+		int zResult = uncompress2(entryData_.data(), &destLen, block2_.data(), &sourceLen);
+		// Handle zip streams missing their Adler-32 checksum (the pre-decrypted 3.60 archive's). The
+		// input runs out with the output full, which zlib 1.4 reports as Z_DATA_ERROR, 1.3 as Z_BUF_ERROR.
+		if ((zResult == Z_BUF_ERROR || zResult == Z_DATA_ERROR) && sourceLen == (uLong)decoded && destLen == contentExpandedSize_ && decrypted_) {
+			zResult = Z_OK;
+		}
+		if (zResult != Z_OK || destLen != contentExpandedSize_) {
+			WARN_LOG(Log::Loader, "PSAR: inflate failed for '%s' (%d)", entryName_.c_str(), zResult);
+			entryData_.clear();
+		}
+	}
+	// Anything else we leave empty - the caller reports it through the stats.
+}
+
+// Writes unpacked files into a directory that started out empty, on threads of its own while the
+// caller goes on decoding. Each directory is created once, and files without checking whether
+// they exist. Through Android's storage framework those checks and creates are round trips to
+// another process, which is nearly all of an install's time, and doing several at once hides most
+// of the wait. The threads are its own rather than the thread pool's: the UI's install already
+// runs on a pool thread, and pool tasks can be dropped unrun at teardown, which would leave
+// Finish() waiting forever.
+class NewFileWriter {
+public:
+	explicit NewFileWriter(PSARUnpackStats *stats) : stats_(stats) {
+		for (int i = 0; i < NUM_THREADS; i++) {
+			threads_.emplace_back([this, i]() { ThreadFunc(i); });
+		}
+	}
+	~NewFileWriter() {
+		Finish();
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			quit_ = true;
+		}
+		cond_.notify_all();
+		for (std::thread &thread : threads_) {
+			thread.join();
+		}
+	}
+
+	void Write(const Path &destination, const std::vector<u8> &data) {
+		const Path dir = destination.NavigateUp();
+		if (createdDirs_.insert(dir.ToString()).second && !File::CreateFullPath(dir)) {
+			ERROR_LOG(Log::Loader, "PSAR: couldn't create a directory for '%s'", destination.c_str());
+			createdDirs_.erase(dir.ToString());
+			stats_->failed++;
+			return;
+		}
+
+		// Case insensitive, since the storage usually is.
+		std::string key = destination.ToString();
+		std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return (char)tolower(c); });
+		if (!files_.insert(key).second) {
+			// The same name twice. The later one wins, as it always has, so let the first land
+			// and then overwrite it the careful way - a blind create would make a renamed copy.
+			Finish();
+			if (File::WriteDataToFile(false, data.data(), data.size(), destination)) {
+				stats_->written++;
+			} else {
+				ERROR_LOG(Log::Loader, "PSAR: couldn't write '%s'", destination.c_str());
+				stats_->failed++;
+			}
+			return;
+		}
+
+		std::unique_lock<std::mutex> lock(mutex_);
+		// Bounded, so memory doesn't fill up with decoded files waiting for a slow disk.
+		cond_.wait(lock, [&] { return queue_.size() + busy_ < MAX_IN_FLIGHT; });
+		queue_.push_back({ destination, data });
+		cond_.notify_all();
+	}
+
+	// Waits for every write so far, and adds their results to the stats.
+	void Finish() {
+		std::unique_lock<std::mutex> lock(mutex_);
+		cond_.wait(lock, [&] { return queue_.empty() && busy_ == 0; });
+		stats_->written += written_;
+		stats_->failed += failed_;
+		written_ = 0;
+		failed_ = 0;
+	}
+
+private:
+	struct Job {
+		Path destination;
+		std::vector<u8> data;
+	};
+
+	void ThreadFunc(int index) {
+		SetCurrentThreadName(StringFromFormat("PSARWrite %d", index).c_str());
+		// Content URIs are JNI calls.
+		AndroidJNIThreadContext jniContext;
+
+		std::unique_lock<std::mutex> lock(mutex_);
+		while (true) {
+			cond_.wait(lock, [&] { return quit_ || !queue_.empty(); });
+			if (queue_.empty()) {
+				return;
+			}
+			Job job = std::move(queue_.front());
+			queue_.pop_front();
+			busy_++;
+			lock.unlock();
+
+			const bool ok = File::WriteDataToNewFile(job.data.data(), job.data.size(), job.destination);
+			if (!ok) {
+				ERROR_LOG(Log::Loader, "PSAR: couldn't write '%s'", job.destination.c_str());
+			}
+
+			lock.lock();
+			busy_--;
+			if (ok)
+				written_++;
+			else
+				failed_++;
+			cond_.notify_all();
+		}
+	}
+
+	static constexpr int NUM_THREADS = 8;
+	static constexpr size_t MAX_IN_FLIGHT = 8;
+
+	PSARUnpackStats *stats_;
+	std::set<std::string> createdDirs_;
+	std::set<std::string> files_;
+	std::vector<std::thread> threads_;
+	// The rest are guarded by mutex_. One condition variable covers all the waits; they're short.
+	std::mutex mutex_;
+	std::condition_variable cond_;
+	std::deque<Job> queue_;
+	size_t busy_ = 0;
+	int written_ = 0;
+	int failed_ = 0;
+	bool quit_ = false;
+};
+
+static void ParseVersionTxt(std::string_view contents, InstalledFirmwareInfo *info);
 
 bool UnpackPSAR(const u8 *psar, size_t psarSize, const Path &outputDir, const PSARUnpackOptions &options, PSARUnpackStats *stats, std::string *error) {
 	PSARUnpackStats localStats;
@@ -711,6 +898,11 @@ bool UnpackPSAR(const u8 *psar, size_t psarSize, const Path &outputDir, const PS
 
 	// One file list per model, filled in as we go - they come before the files they name.
 	std::map<int, std::map<std::string, std::string>> namesByModel;
+
+	std::unique_ptr<NewFileWriter> newFileWriter;
+	if (options.outputDirIsEmpty && !options.listOnly) {
+		newFileWriter.reset(new NewFileWriter(stats));
+	}
 	INFO_LOG(Log::Loader, "Resolving names against model %s", PSPModelGenerationToString(options.model));
 
 	while (true) {
@@ -727,7 +919,6 @@ bool UnpackPSAR(const u8 *psar, size_t psarSize, const Path &outputDir, const PS
 		}
 
 		stats->entries++;
-		stats->compressionCounts[(int)reader.entryCompression()]++;
 
 		if (options.progress && reader.limit() > 0) {
 			options.progress(std::min(1.0f, (float)reader.position() / (float)reader.limit()));
@@ -816,6 +1007,15 @@ bool UnpackPSAR(const u8 *psar, size_t psarSize, const Path &outputDir, const PS
 
 		realName = CanonicalFlashPath(realName);
 
+		// A version 1 archive (1.00) has no version record, so take it from the firmware's own
+		// version.txt, whether or not a filter wants that file.
+		if (stats->firmwareVersion.empty() && equalsNoCase(realName, "flash0:/vsh/etc/version.txt")) {
+			const std::vector<u8> &data = reader.entryData();
+			InstalledFirmwareInfo info;
+			ParseVersionTxt(std::string_view((const char *)data.data(), data.size()), &info);
+			stats->firmwareVersion = info.version;
+		}
+
 		if (realName.empty()) {
 			// No list claimed this one. Still worth writing out under its short name, but a
 			// filter has nothing to match it against.
@@ -829,6 +1029,10 @@ bool UnpackPSAR(const u8 *psar, size_t psarSize, const Path &outputDir, const PS
 			stats->skippedByFilter++;
 			continue;
 		}
+
+		// Past the filter, so this one's contents are worth decrypting. The compression counts
+		// only cover the entries we got this far with, not everything in the archive.
+		stats->compressionCounts[(int)reader.entryCompression()]++;
 
 		if (reader.entryData().empty()) {
 			ERROR_LOG(Log::Loader, "PSAR: no usable contents for '%s' (%s)", reader.entryName().c_str(),
@@ -850,6 +1054,10 @@ bool UnpackPSAR(const u8 *psar, size_t psarSize, const Path &outputDir, const PS
 		}
 
 		const Path destination = outputDir / relative;
+		if (newFileWriter) {
+			newFileWriter->Write(destination, reader.entryData());
+			continue;
+		}
 		if (!File::CreateFullPath(destination.NavigateUp())) {
 			ERROR_LOG(Log::Loader, "PSAR: couldn't create a directory for '%s'", relative.c_str());
 			stats->failed++;
@@ -863,6 +1071,9 @@ bool UnpackPSAR(const u8 *psar, size_t psarSize, const Path &outputDir, const PS
 		stats->written++;
 	}
 
+	if (newFileWriter) {
+		newFileWriter->Finish();
+	}
 	return true;
 }
 
@@ -875,7 +1086,7 @@ static const char *UPDATE_PSAR_SUFFIX = "PSP_GAME/SYSDIR/UPDATE/DATA.BIN";
 static const char *UPDATE_SFO_SUFFIX = "PSP_GAME/SYSDIR/UPDATE/PARAM.SFO";
 
 // A disc updater's PARAM.SFO titles itself "PSP(tm) Update ver 3.95"; we want the number.
-static std::string VersionFromUpdaterTitle(std::string_view title) {
+std::string VersionFromUpdaterTitle(std::string_view title) {
 	const size_t space = title.rfind(' ');
 	if (space != std::string_view::npos) {
 		return std::string(title.substr(space + 1));
@@ -1017,6 +1228,270 @@ static bool ReadUpdaterPSAR(const Path &filename, std::vector<u8> *psar, std::st
 	return false;
 }
 
+// Adds up everything under a directory. Returns false if the directory isn't there at all, which
+// is how the caller tells "no firmware" from "an empty one".
+static bool ScanDirRecursive(const Path &dir, int *fileCount, u64 *totalSize) {
+	std::vector<File::FileInfo> files;
+	if (!File::GetFilesInDir(dir, &files)) {
+		return false;
+	}
+	for (const File::FileInfo &file : files) {
+		if (file.isDirectory) {
+			ScanDirRecursive(file.fullName, fileCount, totalSize);
+		} else {
+			(*fileCount)++;
+			*totalSize += file.size;
+		}
+	}
+	return true;
+}
+
+// Whether a directory holds anything at all, without walking into it. flash0's contents are always
+// in subdirectories (font/, kd/, vsh/, ...), so one listing settles "is anything installed".
+static bool DirHasEntries(const Path &dir) {
+	std::vector<File::FileInfo> files;
+	return File::GetFilesInDir(dir, &files) && !files.empty();
+}
+
+static int CountFilesInDir(const Path &dir) {
+	std::vector<File::FileInfo> files;
+	if (!File::GetFilesInDir(dir, &files)) {
+		return 0;
+	}
+	int count = 0;
+	for (const File::FileInfo &file : files) {
+		if (!file.isDirectory) {
+			count++;
+		}
+	}
+	return count;
+}
+
+// flash0:/vsh/etc/version.txt, as the firmware itself writes it:
+//   release:6.60:
+//   build:5455,0,3,1,0:builder@vsh-build6
+//   system:57716@release_660,0x06060010:
+//   vsh:p6616@release_660,v58533@release_660,20110727:
+//   target:1:WorldWide
+// The date at the end of the vsh line is the only date in there, and the target line's last
+// field is the region the firmware was built for.
+static void ParseVersionTxt(std::string_view contents, InstalledFirmwareInfo *info) {
+	std::vector<std::string_view> lines;
+	SplitString(contents, '\n', lines);
+	for (std::string_view line : lines) {
+		line = StripSpaces(line);
+		if (startsWith(line, "release:")) {
+			std::string_view rest = line.substr(strlen("release:"));
+			const size_t colon = rest.find(':');
+			info->version = std::string(colon == std::string_view::npos ? rest : rest.substr(0, colon));
+		} else if (startsWith(line, "vsh:")) {
+			// The build date is the last comma-separated field, e.g. "...,20110727:".
+			std::string_view rest = line.substr(strlen("vsh:"));
+			if (!rest.empty() && rest.back() == ':') {
+				rest = rest.substr(0, rest.size() - 1);
+			}
+			const size_t comma = rest.rfind(',');
+			if (comma != std::string_view::npos) {
+				const std::string_view date = rest.substr(comma + 1);
+				if (date.size() == 8 && std::all_of(date.begin(), date.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+					info->buildDate = StringFromFormat("%.*s-%.*s-%.*s",
+						4, date.data(), 2, date.data() + 4, 2, date.data() + 6);
+				}
+			}
+		} else if (startsWith(line, "target:")) {
+			const size_t colon = line.rfind(':');
+			if (colon != std::string_view::npos && colon + 1 < line.size()) {
+				info->target = std::string(line.substr(colon + 1));
+			}
+		}
+	}
+}
+
+void ReadInstalledFirmwareInfo(const Path &nandRoot, InstalledFirmwareInfo *info, bool countFiles) {
+	*info = InstalledFirmwareInfo{};
+
+	const Path flash0 = nandRoot / "flash0";
+	if (countFiles) {
+		for (const char *dir : { "flash0", "flash1", "ipl" }) {
+			ScanDirRecursive(nandRoot / dir, &info->fileCount, &info->totalSize);
+		}
+		info->anythingInstalled = info->fileCount > 0;
+	} else {
+		// Cheap equivalent: an install always has files under flash0, so one listing settles it.
+		info->anythingInstalled = DirHasEntries(flash0);
+	}
+	if (!info->anythingInstalled) {
+		return;
+	}
+
+	info->fontCount = CountFilesInDir(flash0 / "font");
+	info->kernelModuleCount = CountFilesInDir(flash0 / "kd");
+	info->hasVsh = File::Exists(flash0 / "vsh/module/vshmain.prx");
+
+	std::string versionTxt;
+	if (File::ReadTextFileToString(flash0 / "vsh/etc/version.txt", &versionTxt)) {
+		ParseVersionTxt(versionTxt, info);
+	}
+
+	// 3.x names them nandipl_psp1000.bin and nandipl_psp2000.ipl (psp02h in 4.x), 5.x on nandipl_01g.bin
+	// and so on. Older firmwares have one psp_ipl.bin or psp_nandipl.bin for every model.
+	std::vector<File::FileInfo> ipls;
+	File::GetFilesInDir(nandRoot / "ipl", &ipls);
+	bool anyModelTagged = false;
+	for (const File::FileInfo &ipl : ipls) {
+		const std::string name = ipl.name;
+		const bool for1000 = name.find("psp1000") != std::string::npos || name.find("_01g") != std::string::npos;
+		const bool for2000 = name.find("psp2000") != std::string::npos || name.find("psp02h") != std::string::npos || name.find("_02g") != std::string::npos;
+		info->forPSP1000 |= for1000;
+		info->forPSP2000 |= for2000;
+		anyModelTagged |= for1000 || for2000 || name.find("g.") != std::string::npos;
+	}
+	if (!anyModelTagged) {
+		info->forPSP1000 = true;
+		info->forPSP2000 = true;
+	}
+}
+
+bool InstalledFirmwareFitsModel(const InstalledFirmwareInfo &info, int pspModel) {
+	if (!info.hasVsh) {
+		return true;
+	}
+	return pspModel == PSP_MODEL_FAT ? info.forPSP1000 : info.forPSP2000;
+}
+
+bool EraseInstalledFirmware(const Path &nandRoot, std::string *error) {
+	bool success = true;
+	for (const char *dir : { "flash0", "flash1", "ipl" }) {
+		const Path path = nandRoot / dir;
+		if (File::Exists(path) && !File::DeleteDirRecursively(path)) {
+			ERROR_LOG(Log::Loader, "Failed to erase %s", path.c_str());
+			if (error) {
+				*error = "Couldn't erase " + path.ToString();
+			}
+			success = false;
+		}
+	}
+
+	// Also reset the category version.
+	g_Config.iSceRegCategoryVersion = 1;
+	return success;
+}
+
+int SceRegCategoryVersionForFirmware(std::string_view version) {
+	// The default of /REGISTRY/category_version in each firmware's registry schema, a table of
+	// { name, type, size, default } entries in vsh/module/vshmain.prx (common_util.prx before 2.00).
+	// When the stored version is below this, the shell writes the default of every key added since
+	// that version (from 1, that includes umd_autoboot). One above it means a corrupt registry.
+	static const struct {
+		int firmware;  // The first firmware with this version, as FirmwareVersionToInt() gives it.
+		int categoryVersion;
+	} versions[] = {
+		{ 100, 0x00 }, { 150, 0x01 }, { 200, 0x06 }, { 250, 0x13 }, { 260, 0x14 }, { 270, 0x1b },
+		{ 280, 0x20 }, { 300, 0x26 }, { 310, 0x2c }, { 330, 0x31 }, { 350, 0x35 }, { 360, 0x36 },
+		{ 370, 0x3b }, { 380, 0x3e }, { 395, 0x40 }, { 405, 0x43 }, { 420, 0x46 }, { 500, 0x4c },
+		{ 550, 0x58 }, { 570, 0x61 }, { 600, 0x63 }, { 620, 0x64 }, { 630, 0x66 },
+	};
+	const int fw = FirmwareVersionToInt(version);
+	if (fw < versions[0].firmware) {
+		return 1;
+	}
+	int categoryVersion = versions[0].categoryVersion;
+	for (const auto &v : versions) {
+		if (fw >= v.firmware) {
+			categoryVersion = v.categoryVersion;
+		}
+	}
+	return categoryVersion;
+}
+
+int SceRegCategoryVersionAfterInstall(int storedVersion, int schemaVersion) {
+	// A shell upgrades the registry itself at its first boot: it writes the default of every key added
+	// since the stored version and stores its own (seen booting 3.71 and 6.61 on older versions). So an
+	// upgrade leaves the stored version alone. A PSP can't be downgraded, and an older shell takes a newer
+	// version for a corrupt registry, so a downgrade goes back to 1. Its first boot then rewrites every
+	// key added since 1.50, which includes the theme, colour, wallpaper and UMD autoboot settings; the
+	// language, nickname, button assignment, date and time keys are older and stay. Keeping a newer
+	// shell's values across a downgrade and back broke the theme settings and then 6.61's boot (#22909).
+	if (storedVersion > schemaVersion) {
+		return 1;
+	}
+	return storedVersion;
+}
+
+int FirmwareVersionToInt(std::string_view version) {
+	const size_t dot = version.find('.');
+	if (dot == std::string_view::npos || dot == 0 || dot + 1 >= version.size()) {
+		return 0;
+	}
+	int numeric = 0;
+	for (size_t i = 0; i < version.size(); i++) {
+		if (i == dot) {
+			continue;
+		}
+		if (version[i] < '0' || version[i] > '9') {
+			return 0;
+		}
+		numeric = numeric * 10 + (version[i] - '0');
+	}
+	if (version.size() - dot == 2) {  // One digit after the dot.
+		numeric *= 10;
+	} else if (version.size() - dot != 3) {
+		return 0;
+	}
+	return numeric;
+}
+
+bool FirmwareVersionSupportsVSH(std::string_view version) {
+	// Every firmware boots to an interactive XMB, checked one release at a time against all 39
+	// versions that ship on a disc - 1.50 through 6.60 - plus the download-only 6.61. So the
+	// only question left is whether this is a firmware at all: a fonts-only NAND has no version
+	// and nothing to boot.
+	//
+	// The lower bound is a sanity check rather than a real limit. 1.50 is the oldest firmware
+	// there is, so anything below it isn't a version string we wrote.
+	return FirmwareVersionToInt(version) >= 150;
+}
+
+// Measured by booting Bourne Supremacy with auto-start on: 2.71 through 6.61 reach its disc menu.
+// 1.50, 2.00 and 2.60 crash in video_plugin or paf as soon as the disc is in the drive, and 2.50
+// says the system software (version ".") is too old for it.
+const char *const UMD_VIDEO_MIN_FIRMWARE = "2.71";
+
+bool FirmwareVersionPlaysUmdVideo(std::string_view version) {
+	return FirmwareVersionSupportsVSH(version) && FirmwareVersionToInt(version) >= FirmwareVersionToInt(UMD_VIDEO_MIN_FIRMWARE);
+}
+
+bool InstalledFirmwareRunsPS1Discs() {
+	// The POPS managers PopsBoot knows for converted EBOOTs: 3.95 to 6.61. A version in between that it
+	// doesn't know fails the boot with a message saying so.
+	InstalledFirmwareInfo info;
+	ReadInstalledFirmwareInfo(g_Config.nandRootDirectory, &info, false);
+	const int version = FirmwareVersionToInt(info.version);
+	return version >= 395 && version <= 661 && File::Exists(g_Config.nandRootDirectory / "flash0/kd/popsman.prx");
+}
+
+Path GetUmdVideoVSHPath() {
+	InstalledFirmwareInfo info;
+	ReadInstalledFirmwareInfo(g_Config.nandRootDirectory, &info, false);
+	if (!info.hasVsh || !FirmwareVersionPlaysUmdVideo(info.version)) {
+		return Path();
+	}
+	return g_Config.nandRootDirectory / "flash0/vsh/module/vshmain.prx";
+}
+
+std::string GetVSHTitle(const Path &path) {
+	if (!equalsNoCase(path.GetFilename(), "vshmain.prx")) {
+		return std::string();
+	}
+	// The firmware it's from: flash0:/vsh/module/vshmain.prx has flash0:/vsh/etc/version.txt.
+	InstalledFirmwareInfo info;
+	std::string versionTxt;
+	if (File::ReadTextFileToString(path.NavigateUp().NavigateUp() / "etc/version.txt", &versionTxt)) {
+		ParseVersionTxt(versionTxt, &info);
+	}
+	return info.version.empty() ? std::string("XMB") : "XMB " + info.version;
+}
+
 std::string BundledUpdateInfo::Describe() const {
 	if (!present) {
 		return std::string();
@@ -1090,16 +1565,60 @@ static bool ReadFromMountedDisc(const char *suffix, std::vector<u8> *out) {
 	return !out->empty();
 }
 
+// Just the front of a file on the mounted disc. DATA.BIN is around a hundred MB, and the version
+// we're after lives in its first record.
+static bool ReadHeadFromMountedDisc(const char *suffix, size_t bytes, std::vector<u8> *out) {
+	const int fd = pspFileSystem.OpenFile(std::string("disc0:/") + suffix, FILEACCESS_READ);
+	if (fd < 0) {
+		return false;
+	}
+	out->resize(bytes);
+	const size_t read = pspFileSystem.ReadFile(fd, out->data(), (s64)bytes);
+	pspFileSystem.CloseFile(fd);
+	out->resize(std::min(read, bytes));
+	return !out->empty();
+}
+
+// The version the archive declares about itself, which is in its first record - so this needs the
+// front of DATA.BIN and nothing else. Worth having as a fallback because the PARAM.SFO sitting
+// next to the updater is zero bytes long on a fair number of discs.
+static std::string ReadUpdaterVersionFromArchiveHeader() {
+	std::vector<u8> head;
+	if (!ReadHeadFromMountedDisc(UPDATE_PSAR_SUFFIX, 64 * 1024, &head)) {
+		return std::string();
+	}
+	if (head.size() < 0x40 || ReadU32(head.data()) != PSAR_MAGIC) {
+		// Very common, and not a problem: a PSN release keeps the updater's directory entry but
+		// zero-fills the file, so there's nothing on the disc to install in the first place.
+		DEBUG_LOG(Log::Loader, "The disc's DATA.BIN isn't an archive - a placeholder, most likely");
+		return std::string();
+	}
+	PSARReader reader(head.data(), head.size());
+	std::string error;
+	if (!reader.Init(&error)) {
+		WARN_LOG(Log::Loader, "Couldn't read the disc updater's header: %s", error.c_str());
+		return std::string();
+	}
+	return reader.firmwareVersion();
+}
+
 bool MountedDiscHasUpdater() {
-	return pspFileSystem.GetFileInfo(std::string("disc0:/") + UPDATE_PSAR_SUFFIX).exists;
+	// Plenty of discs keep the updater's files with nothing in them: UMD Video discs ship a 0-byte
+	// DATA.BIN next to a real PARAM.SFO, PSN releases zero-fill it. Only an actual archive counts.
+	std::vector<u8> head;
+	return ReadHeadFromMountedDisc(UPDATE_PSAR_SUFFIX, 4, &head) && head.size() == 4 && ReadU32(head.data()) == PSAR_MAGIC;
 }
 
 std::string ReadMountedDiscUpdaterVersion() {
 	std::vector<u8> sfo;
-	if (!ReadFromMountedDisc(UPDATE_SFO_SUFFIX, &sfo)) {
-		return std::string();
+	if (ReadFromMountedDisc(UPDATE_SFO_SUFFIX, &sfo)) {
+		const std::string version = VersionFromSFO(sfo);
+		if (!version.empty()) {
+			return version;
+		}
 	}
-	return VersionFromSFO(sfo);
+	// No SFO, or an empty one - ask the archive itself.
+	return ReadUpdaterVersionFromArchiveHeader();
 }
 
 bool UnpackUpdaterFromMountedDisc(const Path &outputDir, const PSARUnpackOptions &options, PSARUnpackStats *stats, std::string *error) {
@@ -1113,6 +1632,11 @@ bool UnpackUpdaterFromMountedDisc(const Path &outputDir, const PSARUnpackOptions
 		*error = "The mounted disc has no updater on it";
 		return false;
 	}
+
+	// Write a nomedia file to avoid Android indexing the files.
+#if PPSSPP_PLATFORM(ANDROID)
+	File::CreateEmptyFile(outputDir / ".nomedia");
+#endif
 
 	INFO_LOG(Log::Loader, "Found a %d byte updater on the mounted disc", (int)psar.size());
 	return UnpackPSAR(psar.data(), psar.size(), outputDir, options, stats, error);
@@ -1129,4 +1653,188 @@ bool UnpackUpdater(const Path &filename, const Path &outputDir, const PSARUnpack
 		return false;
 	}
 	return UnpackPSAR(psar.data(), psar.size(), outputDir, options, stats, error);
+}
+
+// An install is assembled here first and only swapped into place once it's known to be complete.
+// A subdirectory of the NAND root rather than a temp dir elsewhere, so it's on the same volume and
+// the swap at the end is a rename per top-level entry instead of a second copy of the firmware.
+static const char *FIRMWARE_STAGING_DIR = "install-staging";
+
+// Replaces what's in the NAND with what's in the staging directory. Everything the unpack produced
+// moves, not just flash0/flash1/ipl: an entry no file list claimed is written out under its short
+// name, which lands at the top level.
+static bool SwapStagingIntoPlace(const Path &nandRoot, const Path &staging, std::string *error) {
+	std::vector<File::FileInfo> entries;
+	if (!File::GetFilesInDir(staging, &entries) || entries.empty()) {
+		*error = "Nothing to install - the staging directory is empty";
+		return false;
+	}
+
+	// Past this point the NAND is being rewritten. Everything that can fail has already been
+	// done, so the window where an interruption leaves a half-built NAND is these few renames.
+	if (!EraseInstalledFirmware(nandRoot, error)) {
+		return false;
+	}
+
+	for (const File::FileInfo &entry : entries) {
+		const Path destination = nandRoot / entry.name;
+		// EraseInstalledFirmware covers the three directories a firmware normally has; a loose
+		// top-level file wouldn't be one of them.
+		if (File::Exists(destination)) {
+			const bool removed = entry.isDirectory ? File::DeleteDirRecursively(destination) : File::Delete(destination);
+			if (!removed) {
+				*error = "Couldn't replace " + destination.ToString();
+				return false;
+			}
+		}
+		// MoveIfFast rather than Rename: the two are in different directories, which plain
+		// Rename refuses for content URIs, and this is the same-name case MoveIfFast handles.
+		if (!File::MoveIfFast(entry.fullName, destination)) {
+			*error = "Couldn't move " + entry.fullName.ToString() + " into place";
+			return false;
+		}
+	}
+	return true;
+}
+
+bool InstallFirmware(const Path &updater, const Path &nandRoot, const PSARUnpackOptions &options, PSARUnpackStats *stats, std::string *error) {
+	PSARUnpackStats localStats;
+	if (!stats) {
+		stats = &localStats;
+	}
+	std::string localError;
+	if (!error) {
+		error = &localError;
+	}
+
+	INFO_LOG(Log::Loader, "Installing the firmware from %s into %s (model %s)",
+		updater.empty() ? "the mounted disc" : updater.c_str(), nandRoot.c_str(),
+		PSPModelGenerationToString(options.model));
+
+	// Unpack somewhere harmless first, so that everything below can refuse the install without
+	// having touched the firmware that's already there. Anything left over from an install that
+	// was interrupted has nothing to do with this one.
+	const Path staging = nandRoot / FIRMWARE_STAGING_DIR;
+	if (File::Exists(staging) && !File::DeleteDirRecursively(staging)) {
+		*error = "Couldn't clear " + staging.ToString();
+		return false;
+	}
+
+	// The staging directory was just cleared, so the unpack can skip checking for each file.
+	PSARUnpackOptions stagingOptions = options;
+	stagingOptions.outputDirIsEmpty = true;
+	bool ok = updater.empty()
+		? UnpackUpdaterFromMountedDisc(staging, stagingOptions, stats, error)
+		: UnpackUpdater(updater, staging, stagingOptions, stats, error);
+
+	if (ok && stats->written == 0) {
+		// Nothing came out, so the archive had no file list for the model we asked for - old
+		// firmwares predate the later models. Not something to call a success.
+		if (error->empty()) {
+			*error = "The updater has no firmware for this PSP model";
+		}
+		ok = false;
+	}
+	if (ok && stats->failed > 0) {
+		// Some entry didn't survive - a bad dump or a failing disc (every record is hash-checked
+		// on the way out, so corruption can't slip past), or the disk filled up. A firmware with
+		// holes in it is worse than the one already installed: it boots far enough to be believed
+		// and, since it looks like a complete install, nothing would ever replace it.
+		if (error->empty()) {
+			*error = StringFromFormat("%d of %d files couldn't be unpacked", stats->failed, stats->failed + stats->written);
+		}
+		ok = false;
+	}
+
+	if (ok) {
+		ok = SwapStagingIntoPlace(nandRoot, staging, error);
+	}
+	if (ok) {
+		// The shell refuses to install a theme without this directory, and the updater's archive
+		// doesn't have it (6.61's has nothing under flash1), so the real updater must create it.
+		const Path themeDir = nandRoot / "flash1/vsh/theme";
+		if (!File::CreateFullPath(themeDir)) {
+			WARN_LOG(Log::Loader, "Couldn't create %s", themeDir.c_str());
+		}
+
+		g_Config.iSceRegCategoryVersion = SceRegCategoryVersionAfterInstall(g_Config.iSceRegCategoryVersion, SceRegCategoryVersionForFirmware(stats->firmwareVersion));
+	}
+
+	// Whether it worked or not, don't leave the staging copy behind.
+	if (File::Exists(staging) && !File::DeleteDirRecursively(staging)) {
+		WARN_LOG(Log::Loader, "Couldn't clean up %s", staging.c_str());
+	}
+	return ok;
+}
+
+// The OSD id for the automatic install, so the progress bar updates in place.
+static const char *AUTO_INSTALL_OSD_ID = "firmware_install";
+
+bool AutoInstallFirmwareFromDisc() {
+	if (!g_Config.bAutoUpgradeFirmware || !MountedDiscHasUpdater()) {
+		return false;
+	}
+
+	const std::string discVersion = ReadMountedDiscUpdaterVersion();
+	const int discVersionNumber = FirmwareVersionToInt(discVersion);
+	if (discVersionNumber == 0) {
+		// Neither the updater's PARAM.SFO nor the archive itself says which version this is -
+		// usually because there's no real archive there, just a zero-filled placeholder. Without
+		// a version there's no telling an upgrade from a downgrade, so leave the NAND alone.
+		INFO_LOG(Log::Loader, "The disc has an updater, but no version to compare against ('%s')", discVersion.c_str());
+		return false;
+	}
+
+	const Path nandRoot = GetSysDirectory(DIRECTORY_NAND);
+
+	// Write a nomedia file to avoid Android indexing the files.
+#if PPSSPP_PLATFORM(ANDROID)
+	File::CreateEmptyFile(nandRoot / ".nomedia");
+#endif
+
+	InstalledFirmwareInfo installed;
+	ReadInstalledFirmwareInfo(nandRoot, &installed, false);
+
+	const int installedVersion = FirmwareVersionToInt(installed.version);
+	if (installedVersion != 0) {
+		if (discVersionNumber <= installedVersion) {
+			return false;
+		}
+	} else if (installed.kernelModuleCount > 0) {
+		// A real firmware whose version.txt we couldn't read. Replacing it on every single boot,
+		// on the off chance that the disc's is newer, isn't worth it.
+		WARN_LOG(Log::Loader, "A firmware is installed but doesn't say which version it is. Leaving it alone.");
+		return false;
+	}
+	// Otherwise there's either nothing installed or only a partial install like the fonts, and
+	// the disc's firmware is an upgrade either way.
+
+	INFO_LOG(Log::Loader, "Auto-installing firmware %s from the disc (installed: '%s')",
+		discVersion.c_str(), installed.version.c_str());
+
+	auto sy = GetI18NCategory(I18NCat::SYSTEM);
+	const std::string message = std::string(sy->T("Installing firmware")) + " " + discVersion;
+	g_OSD.SetProgressBar(AUTO_INSTALL_OSD_ID, message, 0.0f, 1.0f, 0.0f, 0.0f);
+
+	PSARUnpackOptions options;
+	options.model = EmulatedModelGeneration();
+	options.progress = [&message](float progress) {
+		g_OSD.SetProgressBar(AUTO_INSTALL_OSD_ID, message, 0.0f, 1.0f, progress, 0.0f);
+	};
+
+	PSARUnpackStats stats;
+	std::string error;
+	const bool success = InstallFirmware(Path(), nandRoot, options, &stats, &error);
+	g_OSD.RemoveProgressBar(AUTO_INSTALL_OSD_ID, success, 0.0f);
+
+	if (!success) {
+		ERROR_LOG(Log::Loader, "Failed to install the firmware from the disc: %s", error.c_str());
+		g_OSD.Show(OSDType::MESSAGE_ERROR, sy->T("Firmware installation failed"), error, 5.0f);
+		return false;
+	}
+
+	INFO_LOG(Log::Loader, "Installed firmware %s from the disc: %d files, %d failed",
+		stats.firmwareVersion.c_str(), stats.written, stats.failed);
+	g_OSD.Show(OSDType::MESSAGE_SUCCESS, sy->T("Installed firmware"), stats.firmwareVersion, 3.0f);
+	return true;
 }

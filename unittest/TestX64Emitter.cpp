@@ -5,8 +5,6 @@
 #include "Common/CPUDetect.h"
 #include "Common/x64Analyzer.h"
 #include "Common/x64Emitter.h"
-#include "Core/MIPS/x86/RegCacheFPU.h"
-#include "Core/MIPS/x86/Jit.h"
 #include "Core/MIPS/JitCommon/JitState.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/MIPS/MIPSVFPUUtils.h"
@@ -74,6 +72,16 @@ bool TestX64Emitter() {
 	prevStart = emitter.GetCodePointer();
 	emitter.MOV(32, MDisp(RCX, 4), R(EAX));
 	RET(CheckAnalyze(emitter, true, InstructionClass::GPR, 4));
+
+	// The 8-bit forms, which the JIT emits for a guest sb/lb. These used to fail to decode
+	// entirely, so MemFault couldn't skip or ignore a bad byte access the way it can a word one.
+	prevStart = emitter.GetCodePointer();
+	emitter.MOV(8, MDisp(RCX, 4), R(AL));
+	RET(CheckAnalyze(emitter, true, InstructionClass::GPR, 1));
+
+	prevStart = emitter.GetCodePointer();
+	emitter.MOV(8, R(AL), MDisp(RCX, 4));
+	RET(CheckAnalyze(emitter, false, InstructionClass::GPR, 1));
 
 	prevStart = emitter.GetCodePointer();
 	emitter.MOVZX(32, 8, EAX, MDisp(RCX, 4));

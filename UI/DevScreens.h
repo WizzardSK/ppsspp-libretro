@@ -148,7 +148,6 @@ public:
 	const char *tag() const override { return "FrameDumpTest"; }
 
 private:
-	bool ShowSearchControls() const override { return false; }
 
 	std::vector<std::string> files_;
 	std::shared_ptr<http::Request> listing_;
@@ -157,6 +156,8 @@ private:
 
 class TouchTestScreen : public UIBaseDialogScreen {
 public:
+	// Shows touches where they are on the screen.
+	bool LimitContentArea() const override { return false; }
 	TouchTestScreen(const Path &gamePath) : UIBaseDialogScreen(gamePath) {
 		for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
 			touches_[i].id = -1;
@@ -198,6 +199,15 @@ protected:
 	void OnImmersiveModeChange(UI::EventParams &e);
 	void OnRenderingBackend(UI::EventParams &e);
 	void OnRecreateActivity(UI::EventParams &e);
+};
+
+// Ramps, steps, hue wheels and a gamma check, to compare how outputs (window, VR headset, backends)
+// show the same values.
+class ColorTestScreen : public UIBaseDialogScreen {
+public:
+	bool LimitContentArea() const override { return false; }
+	void CreateViews() override;
+	const char *tag() const override { return "ColorTest"; }
 };
 
 void DrawProfile(UIContext &ui);

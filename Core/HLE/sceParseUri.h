@@ -15,16 +15,16 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+// NOTE: a graduation candidate, but not graduated. sceParseUri is a small library with no
+// dependencies beyond the kernel, and most games that use it ship their own copy - but it is also
+// in the firmware, and sceUtility can load it (module 0x103), so a game may import it without
+// carrying one. Letting the game's module win would hand that game unresolved imports. It can
+// follow once sceUtility loads the firmware copy the way it does for sceMp3 and sceMp4.
+
 #pragma once
 
-#ifdef _MSC_VER
-#define PACK  // on MSVC we use #pragma pack() instead so let's kill this.
-#pragma pack(push, 1)
-#else
-#define PACK __attribute__((packed))
-#endif
-
-typedef struct PSPParsedUri {
+// This used to have pragma pack, but useless as all members are naturally aligned.
+struct PSPParsedUri {
 	s32 noSlash;
 	s32 schemeAddr;
 	s32 userInfoUserNameAddr;
@@ -35,10 +35,8 @@ typedef struct PSPParsedUri {
 	s32 fragmentAddr;
 	u16 port;
 	u8 unknown[10]; // padding might be included here?
-} PACK PSPParsedUri;
+};
 
-#ifdef _MSC_VER 
-#pragma pack(pop)
-#endif
+static_assert(sizeof(PSPParsedUri) == 44, "PSPParsedUri size mismatch");
 
 void Register_sceParseUri();

@@ -90,7 +90,7 @@ HRESULT SamplerCacheD3D11::GetOrCreateSampler(ID3D11Device *device, const Sample
 	samp.AddressV = key.tClamp ? D3D11_TEXTURE_ADDRESS_CLAMP : D3D11_TEXTURE_ADDRESS_WRAP;
 	samp.AddressW = samp.AddressU;  // Mali benefits from all clamps being the same, and this one is irrelevant.
 	if (key.aniso) {
-		samp.MaxAnisotropy = (float)(1 << g_Config.iAnisotropyLevel);
+		samp.MaxAnisotropy = (float)(1 << key.anisoLevel);
 	} else {
 		samp.MaxAnisotropy = 1.0f;
 	}
@@ -178,9 +178,14 @@ void TextureCacheD3D11::DeviceLost() {
 	TextureCacheCommon::DeviceLost();
 	DestroyDeviceObjects();
 	draw_ = nullptr;
+	device_ = nullptr;
+	context_ = nullptr;
 }
 
-void TextureCacheD3D11::DeviceRestore(Draw::DrawContext *draw) { 
+void TextureCacheD3D11::DeviceRestore(Draw::DrawContext *draw) {
+	// The restored context can be a new device, so don't keep the old pointers.
+	device_ = (ID3D11Device *)draw->GetNativeObject(Draw::NativeObject::DEVICE);
+	context_ = (ID3D11DeviceContext *)draw->GetNativeObject(Draw::NativeObject::CONTEXT);
 	TextureCacheCommon::DeviceRestore(draw);
 	InitDeviceObjects();
 }
@@ -247,7 +252,8 @@ void TextureCacheD3D11::BuildTexture(TexCacheEntry *const entry) {
 
 	DXGI_FORMAT dstFmt = GetDestFormat(GETextureFormat(entry->format), gstate.getClutPaletteFormat());
 	if (plan.doReplace) {
-		dstFmt = ToDXGIFormat(plan.replaced->Format());
+		// Indices for the GPU are uploaded as the R8 format of the CLUT8 textures.
+		dstFmt = plan.decodeToClut8 ? DXGI_FORMAT_R8_UNORM : ToDXGIFormat(plan.replaced->Format());
 	} else if (plan.scaleFactor > 1 || plan.saveTexture) {
 		dstFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
 	} else if (plan.decodeToClut8) {
@@ -260,12 +266,24 @@ void TextureCacheD3D11::BuildTexture(TexCacheEntry *const entry) {
 	ID3D11Resource *texture = DxTex(entry);
 	_assert_(texture == nullptr);
 
-	// The PSP only supports 8 mip levels, but we support more in the texture replacer. 20 will never run out.
-	D3D11_SUBRESOURCE_DATA subresData[20]{};
+	// The PSP only supports 8 mip levels, but we support more in the texture replacer. 16 will never run out,
+	// D3D11 caps textures at 16384 pixels anyway.
+	D3D11_SUBRESOURCE_DATA subresData[16]{};
+
+	auto freeSubresData = [&subresData]() {
+		for (size_t i = 0; i < ARRAY_SIZE(subresData); i++) {
+			if (subresData[i].pSysMem) {
+				FreeAlignedMemory((void *)subresData[i].pSysMem);
+				subresData[i].pSysMem = nullptr;
+			}
+		}
+	};
 
 	if (plan.depth == 1) {
 		// We don't yet have mip generation, so clamp the number of levels to the ones we can load directly.
 		levels = std::min(plan.levelsToCreate, plan.levelsToLoad);
+		// Only the 2D path indexes subresData per level - the 3D path puts everything in slot 0.
+		_dbg_assert_(levels <= (int)ARRAY_SIZE(subresData));
 	} else {
 		levels = plan.depth;
 	}
@@ -289,7 +307,7 @@ void TextureCacheD3D11::BuildTexture(TexCacheEntry *const entry) {
 				stride = ((mipWidth + 3) & ~3) * blockSize / 4;  // Number of blocks * 4 * Size of a block / 4
 				dataSize = plan.replaced->GetLevelDataSizeAfterCopy(i);
 			} else {
-				int bpp = (int)Draw::DataFormatSizeInBytes(plan.replaced->Format());
+				int bpp = plan.decodeToClut8 ? 1 : (int)Draw::DataFormatSizeInBytes(plan.replaced->Format());
 				stride = std::max(mipWidth * bpp, 16);
 				dataSize = stride * mipHeight;
 			}
@@ -320,6 +338,7 @@ void TextureCacheD3D11::BuildTexture(TexCacheEntry *const entry) {
 
 		if (!data) {
 			ERROR_LOG(Log::G3D, "Ran out of RAM trying to allocate a temporary texture upload buffer (%dx%d)", mipWidth, mipHeight);
+			freeSubresData();
 			return;
 		}
 
@@ -380,11 +399,7 @@ void TextureCacheD3D11::BuildTexture(TexCacheEntry *const entry) {
 	entry->texturePtr = texture;
 	entry->textureView = view;
 
-	for (int i = 0; i < 12; i++) {
-		if (subresData[i].pSysMem) {
-			FreeAlignedMemory((void *)subresData[i].pSysMem);
-		}
-	}
+	freeSubresData();
 
 	// Signal that we support depth textures so use it as one.
 	if (plan.depth > 1) {

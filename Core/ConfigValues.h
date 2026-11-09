@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <memory>
 #include <string>
 #include <string_view>
 #ifndef _MSC_VER
@@ -32,6 +33,8 @@ struct ConfigBlock {
 	virtual bool CanResetToDefault() const { return false; }
 	// If a block returns false here (like Config itself does), resetting to default will happen by the old per-setting mechanism.
 	virtual bool ResetToDefault(std::string_view blockName) { return false; }
+	// For blocks that can reset themselves: a new block with the defaults of the named one, to read defaults from.
+	virtual std::unique_ptr<ConfigBlock> NewDefault(std::string_view blockName) const { return nullptr; }
 	virtual size_t Size() const { return sizeof(ConfigBlock); }  // For sanity checks
 };
 
@@ -132,6 +135,13 @@ enum class GPUBackend {
 	OPENGL = 0,
 	DIRECT3D11 = 2,
 	VULKAN = 3,
+	METAL = 4,
+};
+
+// What an external display (a TV) shows, where the platform lets us choose. See docs/multi-swapchain.md.
+enum class ExternalDisplayMode {
+	SHOW_GAME = 0,  // The game, with the controls and the menus on the device. Needs Metal or Vulkan.
+	MIRROR = 1,
 };
 
 enum class DepthRasterMode {
@@ -146,6 +156,11 @@ enum class AudioSyncMode {
 	CLASSIC_PITCH = 1,
 };
 
+enum class AndroidAudioApi {
+	AAUDIO = 0,
+	OPENSLES = 1,
+};
+
 // TODO: We can make this more fine-grained.
 enum class RestoreSettingsBits : int {
 	SETTINGS = 1,
@@ -154,7 +169,7 @@ enum class RestoreSettingsBits : int {
 };
 ENUM_CLASS_BITOPS(RestoreSettingsBits);
 
-// Modules that are candidates for disabling HLE of.
+// Modules that are candidates for disabling HLE of, and just running the modules directly.
 enum class DisableHLEFlags : int {
 	sceFont = (1 << 0),
 	sceAtrac = (1 << 1),
@@ -164,7 +179,21 @@ enum class DisableHLEFlags : int {
 	sceMp3 = (1 << 5),
 	sceParseHttp = (1 << 6),
 	sceCcc = (1 << 7),  // character conversion library.
-	Count = 8,
+	// Swaps in flash0:/kd/libmp4.prx and mp4msv.prx, which then decode through our sceAudiocodec.
+	sceMp4 = (1 << 8),
+	// Small leaf libraries games carry on the disc themselves - see AlwaysDisableHLEFlags. None of
+	// them is provided in any firmware version.
+	sceDeflt = (1 << 9),
+	sceAdler = (1 << 10),
+	sceMd5 = (1 << 11),
+	sceSha256 = (1 << 12),
+	sceMt19937 = (1 << 13),
+	sceSfmt19937 = (1 << 14),
+	sceHeap = (1 << 15),
+	sceParseUri = (1 << 16),
+	// Runs flash0:/kd/pspnet_adhoc_discover.prx on top of our adhocctl. For checking our HLE against.
+	sceNetAdhocDiscover = (1 << 17),
+	Count = 18,
 	// TODO: Some of the networking libraries may be interesting candidates, like HTTP.
 };
 ENUM_CLASS_BITOPS(DisableHLEFlags);
@@ -221,12 +250,6 @@ enum class ShowStatusFlags {
 	BATTERY_PERCENT = 1 << 3,
 };
 
-enum class SplineQuality {
-	LOW_QUALITY = 0,
-	MEDIUM_QUALITY = 1,
-	HIGH_QUALITY = 2,
-};
-
 enum class DumpFileType {
 	EBOOT = (1 << 0),
 	PRX = (1 << 1),
@@ -242,7 +265,12 @@ enum TiltTypes {
 	TILT_DPAD,
 	TILT_ACTION_BUTTON,
 	TILT_TRIGGER_BUTTONS,
+	TILT_ANALOG_RIGHT,
 };
+
+inline bool TiltTypeIsAnalog(int type) {
+	return type == TILT_ANALOG || type == TILT_ANALOG_RIGHT;
+}
 
 enum class ScreenEdgePosition {
 	BOTTOM_LEFT = 0,
@@ -270,6 +298,7 @@ enum class DebugOverlay : int {
 	GPU_PROFILE,
 	GPU_ALLOCATOR,
 	FRAMEBUFFER_LIST,
+	JIT_STATS,
 };
 
 // Android-only for now
@@ -289,4 +318,9 @@ enum class SkipGPUReadbackMode : int {
 enum class RemoteISOShareType : int {
 	RECENT,
 	LOCAL_FOLDER,
+};
+
+enum class GameBrowserViewMode : int {
+	GRID = 0,
+	LIST = 1,  // XMB-style, with full size icons and the ICON1.PMF video. Old configs may have 2 (the large list) here.
 };

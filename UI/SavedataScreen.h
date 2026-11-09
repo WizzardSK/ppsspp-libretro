@@ -71,7 +71,7 @@ class SavedataView;
 
 class SavedataPopupScreen : public UI::PopupScreen {
 public:
-	SavedataPopupScreen(Path gamePath, Path savePath, std::string_view title);
+	SavedataPopupScreen(Path gamePath, Path savePath, bool showHint, std::string_view title);
 
 	const char *tag() const override { return "SavedataPopup"; }
 	void update() override;
@@ -84,6 +84,7 @@ private:
 	SavedataView *savedataView_ = nullptr;
 	Path savePath_;
 	Path gamePath_;
+	bool showHint_ = false;
 };
 
 class SavedataScreen : public UITabbedBaseDialogScreen {
@@ -95,13 +96,16 @@ public:
 	void dialogFinished(const Screen *dialog, DialogResult result) override;
 	void sendMessage(UIMessage message, const char *value) override;
 
+	ViewLayoutMode LayoutMode() const override {
+		return ViewLayoutMode::ApplyInsets;
+	}
+
 	const char *tag() const override { return "Savedata"; }
 
 protected:
 	void CreateTabs() override;
 	void CreateExtraButtons(UI::ViewGroup *verticalLayout, int margins) override;
 
-	bool ShowSearchControls() const override { return false; }
 	
 private:
 	void OnSavedataButtonClick(UI::EventParams &e);

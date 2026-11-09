@@ -170,15 +170,19 @@ bool VulkanTexture::CreateDirect(int w, int h, int depth, int numMips, VkFormat 
 }
 
 void VulkanTexture::CopyBufferToMipLevel(VkCommandBuffer cmd, TextureCopyBatch *copyBatch, int mip, int mipWidth, int mipHeight, int depthLayer, VkBuffer buffer, uint32_t offset, size_t rowLength) {
+	CopyBufferToMipLevelRegion(cmd, copyBatch, mip, 0, 0, mipWidth, mipHeight, depthLayer, buffer, offset, rowLength);
+}
+
+void VulkanTexture::CopyBufferToMipLevelRegion(VkCommandBuffer cmd, TextureCopyBatch *copyBatch, int mip, int x, int y, int w, int h, int depthLayer, VkBuffer buffer, uint32_t offset, size_t rowLength) {
 	VkBufferImageCopy &copy_region = copyBatch->copies.push_uninitialized();
 	copy_region.bufferOffset = offset;
 	copy_region.bufferRowLength = (uint32_t)rowLength;
 	copy_region.bufferImageHeight = 0;  // 2D
-	copy_region.imageOffset.x = 0;
-	copy_region.imageOffset.y = 0;
+	copy_region.imageOffset.x = x;
+	copy_region.imageOffset.y = y;
 	copy_region.imageOffset.z = depthLayer;
-	copy_region.imageExtent.width = mipWidth;
-	copy_region.imageExtent.height = mipHeight;
+	copy_region.imageExtent.width = w;
+	copy_region.imageExtent.height = h;
 	copy_region.imageExtent.depth = 1;
 	copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	copy_region.imageSubresource.mipLevel = mip;
@@ -280,9 +284,9 @@ void VulkanTexture::GenerateMips(VkCommandBuffer cmd, int firstMipToGenerate, bo
 	}
 }
 
-void VulkanTexture::EndCreate(VkCommandBuffer cmd, bool vertexTexture, VkPipelineStageFlags prevStage, VkImageLayout layout) {
+void VulkanTexture::EndCreate(VkCommandBuffer cmd, VkPipelineStageFlags prevStage, VkImageLayout layout) {
 	VulkanBarrierBatch batch;
-	VkImageMemoryBarrier *barrier = batch.Add(image_, prevStage, vertexTexture ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0);
+	VkImageMemoryBarrier *barrier = batch.Add(image_, prevStage, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0);
 	barrier->subresourceRange.levelCount = numMips_;
 	barrier->oldLayout = layout;
 	barrier->newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;

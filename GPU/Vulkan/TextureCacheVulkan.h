@@ -37,6 +37,8 @@ class StringWriter;
 
 class SamplerCache {
 public:
+	SamplerCache(const SamplerCache &) = delete;
+	SamplerCache &operator=(const SamplerCache &) = delete;
 	SamplerCache(VulkanContext *vulkan) : vulkan_(vulkan), cache_(16) {}
 	~SamplerCache();
 	VkSampler GetOrCreateSampler(const SamplerCacheKey &key);
@@ -99,22 +101,8 @@ private:
 		MULTIPASS,
 	};
 
-	struct MultipassScratchDesc {
-		const char *tag;
-		uint8_t widthScale;
-		uint8_t heightScale;
-	};
-
-	struct MultipassStageDesc {
-		uint8_t shaderIndex;
-		int8_t inputScratch;   // -1 means the original upload buffer.
-		int8_t outputScratch;  // -1 means the final destination image.
-		uint8_t srcWidthScale;
-		uint8_t srcHeightScale;
-		uint8_t dstWidthScale;
-		uint8_t dstHeightScale;
-		bool useFinalOutputSize;
-	};
+	typedef TextureScaleScratchDesc MultipassScratchDesc;
+	typedef TextureScaleStageDesc MultipassStageDesc;
 
 	void LoadVulkanTextureLevel(TexCacheEntry &entry, uint8_t *writePtr, int rowPitch,  int level, int scaleFactor, VkFormat dstFmt);
 	static VkFormat GetDestFormat(GETextureFormat format, GEPaletteFormat clutFormat) ;
@@ -128,7 +116,8 @@ private:
 	bool RunMultipassCompute(VulkanContext *vulkan, VkCommandBuffer cmdInit, VkImageView dstView, VkBuffer texBuf, uint32_t bufferOffset, int srcSize, int srcWidth, int srcHeight, int dstWidth, int dstHeight);
 	bool ScaleBufferToImage(VulkanContext *vulkan, VkCommandBuffer cmdInit, VkImageView dstView, VkBuffer texBuf, uint32_t bufferOffset, int srcSize, int srcWidth, int srcHeight, int dstWidth, int dstHeight);
 
-	void LoadConstantBuffer(VulkanContext *vulkan, VkCommandBuffer cmdInit);
+	// Returns false if the constant buffer couldn't be loaded, in which case hardware scaling gets disabled.
+	bool LoadConstantBuffer(VulkanContext *vulkan, VkCommandBuffer cmdInit);
 
 	VulkanComputeShaderManager computeShaderManager_;
 

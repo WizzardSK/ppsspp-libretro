@@ -66,6 +66,9 @@ void CtrlDisAsmView::scanVisibleFunctions()
 	// Core_LockAgainstShutdown() so the core can't be torn down mid-read. See g_frameMutex in Core.h.
 	std::lock_guard<std::mutex> frameGuard(g_frameMutex);
 	CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+	if (PSP_IsBooting()) {
+		return;
+	}
 	g_disassemblyManager.analyze(windowStart, g_disassemblyManager.getNthNextAddress(windowStart,visibleRows)-windowStart);
 }
 
@@ -209,7 +212,6 @@ CtrlDisAsmView::~CtrlDisAsmView()
 {
 	DeleteObject(font);
 	DeleteObject(boldfont);
-	g_disassemblyManager.clear();
 }
 
 static COLORREF scaleColor(COLORREF color, float factor)

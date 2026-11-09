@@ -197,35 +197,51 @@ LogManager::~LogManager() {
 }
 
 void LogManager::SetFileLogPath(const Path &filename) {
-	std::lock_guard<std::mutex> lk(logFileLock_);
-	if (fp_ && filename == logFilename_) {
-		// All good
-		return;
-	}
+	// A copy, since the caller may pass logFilename_.
+	const Path path = filename;
+	{
+		std::lock_guard<std::mutex> lk(logFileLock_);
+		if (fp_ && path == logFilename_) {
+			// All good
+			return;
+		}
 
-	if (fp_) {
-		fclose(fp_);
-		fp_ = nullptr;
-	}
+		if (fp_) {
+			fclose(fp_);
+			fp_ = nullptr;
+		}
 
-	if (!filename.empty()) {
-		logFilename_ = Path(filename);
-
-		if (outputs_ & LogOutput::File) {
-			File::CreateFullPath(logFilename_.NavigateUp());
-			fp_ = File::OpenCFile(logFilename_, "at");
-			logFileOpenFailed_ = fp_ == nullptr;
-			if (logFileOpenFailed_) {
-				printf("Failed to open log file %s\n", logFilename_.c_str());
-			}
+		if (path.empty()) {
+			return;
+		}
+		logFilename_ = path;
+		if (!(outputs_ & LogOutput::File)) {
+			return;
 		}
 	}
+
+	// Not under logFileLock_: creating and opening the file can log, and logging takes that lock.
+	File::CreateFullPath(path.NavigateUp());
+	FILE *fp = File::OpenCFile(path, "at");
+
+	std::lock_guard<std::mutex> lk(logFileLock_);
+	logFileOpenFailed_ = fp == nullptr;
+	if (!fp) {
+		printf("Failed to open log file %s\n", path.c_str());
+		return;
+	}
+	if (fp_ || !(logFilename_ == path)) {
+		// Another call got in while we were opening.
+		fclose(fp);
+		return;
+	}
+	fp_ = fp;
 }
 
 void LogManager::SaveConfig(Section *section) {
-	if (channelsChangedByDebugger_) {
+	if (doNotSaveChannels_) {
 		// Leave the section as whatever was already on disk - see the doc comment on
-		// NotifyChannelsChangedByDebugger().
+		// DoNotSaveChannels().
 		return;
 	}
 	for (int i = 0; i < (int)Log::NUMBER_OF_LOGS; i++) {
@@ -364,9 +380,41 @@ void LogManager::LogLine(LogLevel level, Log type, const char *file, int line, c
 #endif
 
 	if (outputs_ & LogOutput::ExternalCallback) {
-		if (externalCallback_) {
-			externalCallback_(message, externalUserData_);
+		// Held across the dispatch on purpose: RemoveExternalLogCallback() takes the same lock, so a
+		// listener can't be torn down (and its userdata freed) while we're in the middle of calling it.
+		std::lock_guard<std::mutex> guard(externalLock_);
+		for (const ExternalCallbackEntry &entry : externalCallbacks_) {
+			entry.callback(message, entry.userdata);
 		}
+	}
+}
+
+int LogManager::AddExternalLogCallback(LogCallback callback, void *userdata) {
+	if (!callback) {
+		return -1;
+	}
+	std::lock_guard<std::mutex> guard(externalLock_);
+	const int handle = nextExternalHandle_++;
+	externalCallbacks_.push_back(ExternalCallbackEntry{ handle, callback, userdata });
+	EnableOutput(LogOutput::ExternalCallback);
+	return handle;
+}
+
+void LogManager::RemoveExternalLogCallback(int handle) {
+	if (handle < 0) {
+		return;
+	}
+	std::lock_guard<std::mutex> guard(externalLock_);
+	for (size_t i = 0; i < externalCallbacks_.size(); i++) {
+		if (externalCallbacks_[i].handle == handle) {
+			externalCallbacks_.erase(externalCallbacks_.begin() + i);
+			break;
+		}
+	}
+	// Only when the last one goes away - otherwise removing one connection's callback would stop
+	// delivery to the ones still attached, which is the bug this list exists to avoid.
+	if (externalCallbacks_.empty()) {
+		DisableOutput(LogOutput::ExternalCallback);
 	}
 }
 
@@ -483,27 +531,8 @@ void LogManager::StdioLog(const LogMessage &message) {
 }
 
 void PrintfLog(const LogMessage &message) {
-	const char *category = message.log;
-
-	switch (message.level) {
-	case LogLevel::LVERBOSE:
-		fprintf(stderr, "V %s: %s", category, message.msg.c_str());
-		break;
-	case LogLevel::LDEBUG:
-		fprintf(stderr, "D %s: %s", category, message.msg.c_str());
-		break;
-	case LogLevel::LINFO:
-		fprintf(stderr, "I %s: %s", category, message.msg.c_str());
-		break;
-	case LogLevel::LERROR:
-		fprintf(stderr, "E %s: %s", category, message.msg.c_str());
-		break;
-	case LogLevel::LWARNING:
-		fprintf(stderr, "W %s: %s", category, message.msg.c_str());
-		break;
-	case LogLevel::LNOTICE:
-	default:
-		fprintf(stderr, "N %s: %s", category, message.msg.c_str());
-		break;
-	}
+	// Same shape as the stdio and file outputs the other builds use. It used to be its own
+	// shorter format, which meant a pattern that matched a log from the app quietly matched
+	// nothing in one from headless.
+	fprintf(stderr, "%s %s %s", message.timestamp, message.header, message.msg.c_str());
 }

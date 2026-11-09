@@ -64,9 +64,10 @@ public:
 // A D3D11Framebuffer is a D3D11Framebuffer plus all the textures it owns.
 class D3D11Framebuffer : public Framebuffer {
 public:
-	D3D11Framebuffer(int width, int height) {
+	D3D11Framebuffer(int width, int height, bool zStencil) {
 		width_ = width;
 		height_ = height;
+		hasDepthStencil_ = zStencil;
 	}
 	~D3D11Framebuffer() {
 	}
@@ -112,6 +113,7 @@ public:
 
 	void UpdateBuffer(Buffer *buffer, const uint8_t *data, size_t offset, size_t size, UpdateBufferFlags flags) override;
 	void UpdateTextureLevels(Texture *texture, const uint8_t **data, TextureCallback initDataCallback, int numLevels) override;
+	void UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) override;
 
 	void CopyFramebufferImage(Framebuffer *src, int level, int x, int y, int z, Framebuffer *dst, int dstLevel, int dstX, int dstY, int dstZ, int width, int height, int depth, Aspect aspects, const char *tag) override;
 	bool BlitFramebuffer(Framebuffer *src, int srcX1, int srcY1, int srcX2, int srcY2, Framebuffer *dst, int dstX1, int dstY1, int dstX2, int dstY2, Aspect aspects, FBBlitFilter filter, const char *tag) override;
@@ -248,7 +250,6 @@ private:
 	ComPtr<ID3D11InputLayout> curInputLayout_;
 	ComPtr<ID3D11VertexShader> curVS_;
 	ComPtr<ID3D11PixelShader> curPS_;
-	ComPtr<ID3D11GeometryShader> curGS_;
 	D3D11_PRIMITIVE_TOPOLOGY curTopology_ = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
 	ComPtr<ID3D11Buffer> nextVertexBuffer_;
@@ -286,7 +287,7 @@ private:
 D3D11DrawContext::D3D11DrawContext(ComPtr<ID3D11Device> device, ComPtr<ID3D11DeviceContext> deviceContext, ComPtr<ID3D11Device1> device1, ComPtr<ID3D11DeviceContext1> deviceContext1, ComPtr<IDXGISwapChain> swapChain, D3D_FEATURE_LEVEL featureLevel, HWND hWnd, std::vector<std::string> deviceList, int maxInflightFrames)
 	: hWnd_(hWnd),
 		device_(device),
-		context_(deviceContext1),
+		context_(deviceContext),
 		device1_(device1),
 		context1_(deviceContext1),
 		featureLevel_(featureLevel),
@@ -459,6 +460,7 @@ void D3D11DrawContext::HandleEvent(Event ev, int width, int height, void *param1
 		bbRenderTargetTex_ = (ID3D11Texture2D *)param2;
 		bbWidth_ = width;
 		bbHeight_ = height;
+		primarySwapchain_->SetSize(width, height);
 
 		// Create matching depth stencil texture. This is not really needed for PPSSPP though,
 		// and probably not for most other renderers either as you're usually rendering to other render targets and
@@ -847,7 +849,6 @@ public:
 
 	ComPtr<ID3D11VertexShader> vs;
 	ComPtr<ID3D11PixelShader> ps;
-	ComPtr<ID3D11GeometryShader> gs;
 };
 
 class D3D11Pipeline : public Pipeline {
@@ -868,7 +869,6 @@ public:
 
 	ComPtr<ID3D11VertexShader> vs;
 	ComPtr<ID3D11PixelShader> ps;
-	ComPtr<ID3D11GeometryShader> gs;
 	D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
 	std::vector<D3D11ShaderModule *> shaderModules;
@@ -893,6 +893,7 @@ public:
 
 	bool CreateStagingTexture(ID3D11Device *device);
 	void UpdateTextureLevels(ID3D11DeviceContext *context, ID3D11Device *device, Texture *texture, const uint8_t *const *data, TextureCallback initDataCallback, int numLevels);
+	void UpdateTextureRegions(ID3D11DeviceContext *context, int level, const TextureRegionUpdate *regions, int numRegions);
 
 	ID3D11ShaderResourceView *View() { return view_.Get(); }
 
@@ -1054,6 +1055,22 @@ void D3D11Texture::UpdateTextureLevels(ID3D11DeviceContext *context, ID3D11Devic
 	stagingTex_.Reset();
 }
 
+void D3D11Texture::UpdateTextureRegions(ID3D11DeviceContext *context, int level, const TextureRegionUpdate *regions, int numRegions) {
+	const UINT pixelSize = (UINT)DataFormatSizeInBytes(format_);
+	for (int i = 0; i < numRegions; i++) {
+		const TextureRegionUpdate &region = regions[i];
+		D3D11_BOX box{};
+		box.left = region.x;
+		box.top = region.y;
+		box.front = 0;
+		box.right = region.x + region.w;
+		box.bottom = region.y + region.h;
+		box.back = 1;
+		const UINT srcStride = region.byteStride ? (UINT)region.byteStride : region.w * pixelSize;
+		context->UpdateSubresource(tex_.Get(), level, &box, region.data, srcStride, 0);
+	}
+}
+
 Texture *D3D11DrawContext::CreateTexture(const TextureDesc &desc) {
 	if (!(GetDataFormatSupport(desc.format) & FMT_TEXTURE)) {
 		// D3D11 does not support this format as a texture format.
@@ -1080,6 +1097,11 @@ void D3D11DrawContext::UpdateTextureLevels(Texture *texture, const uint8_t **dat
 	tex->UpdateTextureLevels(context_.Get(), device_.Get(), texture, data, initDataCallback, numLevels);
 }
 
+void D3D11DrawContext::UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) {
+	D3D11Texture *tex = (D3D11Texture *)texture;
+	tex->UpdateTextureRegions(context_.Get(), level, regions, numRegions);
+}
+
 ShaderModule *D3D11DrawContext::CreateShaderModule(ShaderStage stage, ShaderLanguage language, const uint8_t *data, size_t dataSize, const char *tag) {
 	if (language != ShaderLanguage::HLSL_D3D11) {
 		ERROR_LOG(Log::G3D, "Unsupported shader language");
@@ -1088,11 +1110,9 @@ ShaderModule *D3D11DrawContext::CreateShaderModule(ShaderStage stage, ShaderLang
 
 	const char *vertexModel = "vs_4_0";
 	const char *fragmentModel = "ps_4_0";
-	const char *geometryModel = "gs_4_0";
 	if (featureLevel_ <= D3D_FEATURE_LEVEL_9_3) {
 		vertexModel = "vs_4_0_level_9_1";
 		fragmentModel = "ps_4_0_level_9_1";
-		geometryModel = nullptr;
 	}
 
 	std::string compiled;
@@ -1101,11 +1121,6 @@ ShaderModule *D3D11DrawContext::CreateShaderModule(ShaderStage stage, ShaderLang
 	switch (stage) {
 	case ShaderStage::Fragment: target = fragmentModel; break;
 	case ShaderStage::Vertex: target = vertexModel; break;
-	case ShaderStage::Geometry:
-		if (!geometryModel)
-			return nullptr;
-		target = geometryModel;
-		break;
 	case ShaderStage::Compute:
 	default:
 		Crash();
@@ -1145,9 +1160,6 @@ ShaderModule *D3D11DrawContext::CreateShaderModule(ShaderStage stage, ShaderLang
 		break;
 	case ShaderStage::Fragment:
 		result = device_->CreatePixelShader(data, dataSize, nullptr, &module->ps);
-		break;
-	case ShaderStage::Geometry:
-		result = device_->CreateGeometryShader(data, dataSize, nullptr, &module->gs);
 		break;
 	default:
 		ERROR_LOG(Log::G3D, "Unsupported shader stage");
@@ -1201,9 +1213,6 @@ Pipeline *D3D11DrawContext::CreateGraphicsPipeline(const PipelineDesc &desc, con
 		case ShaderStage::Fragment:
 			dPipeline->ps = module->ps;
 			break;
-		case ShaderStage::Geometry:
-			dPipeline->gs = module->gs;
-			break;
 		case ShaderStage::Compute:
 			break;
 		}
@@ -1247,7 +1256,6 @@ void D3D11DrawContext::Invalidate(InvalidationFlags flags) {
 		curRaster_ = nullptr;
 		curPS_.Reset();
 		curVS_.Reset();
-		curGS_.Reset();
 		curInputLayout_.Reset();
 		curTopology_ = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
 		curPipeline_= nullptr;
@@ -1289,10 +1297,6 @@ void D3D11DrawContext::ApplyCurrentState() {
 	if (curPS_ != curPipeline_->ps) {
 		context_->PSSetShader(curPipeline_->ps.Get(), nullptr, 0);
 		curPS_ = curPipeline_->ps;
-	}
-	if (curGS_ != curPipeline_->gs) {
-		context_->GSSetShader(curPipeline_->gs.Get(), nullptr, 0);
-		curGS_ = curPipeline_->gs;
 	}
 	if (curTopology_ != curPipeline_->topology) {
 		context_->IASetPrimitiveTopology(curPipeline_->topology);
@@ -1493,7 +1497,7 @@ uint32_t D3D11DrawContext::GetDataFormatSupport(DataFormat fmt) const {
 
 Framebuffer *D3D11DrawContext::CreateFramebuffer(const FramebufferDesc &desc) {
 	HRESULT hr;
-	D3D11Framebuffer *fb = new D3D11Framebuffer(desc.width, desc.height);
+	D3D11Framebuffer *fb = new D3D11Framebuffer(desc.width, desc.height, desc.z_stencil);
 
 	// We don't (yet?) support multiview for D3D11. Not sure if there's a way to do it.
 	// Texture arrays are supported but we don't have any other use cases yet.
@@ -1648,7 +1652,6 @@ void D3D11DrawContext::BeginFrame(DebugFlags debugFlags) {
 	context_->IASetInputLayout(curInputLayout_.Get());
 	context_->VSSetShader(curVS_.Get(), nullptr, 0);
 	context_->PSSetShader(curPS_.Get(), nullptr, 0);
-	context_->GSSetShader(curGS_.Get(), nullptr, 0);
 	if (curTopology_ != D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED) {
 		context_->IASetPrimitiveTopology(curTopology_);
 	}
@@ -1723,6 +1726,7 @@ bool D3D11DrawContext::BlitFramebuffer(Framebuffer *srcfb, int srcX1, int srcY1,
 }
 
 bool D3D11DrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect channelBits, int bx, int by, int bw, int bh, Draw::DataFormat destFormat, void *pixels, int pixelStride, ReadbackMode mode, const char *tag) {
+	src = PrimaryToNull(src);
 	D3D11Framebuffer *fb = (D3D11Framebuffer *)src;
 
 	if (fb) {
@@ -1747,12 +1751,13 @@ bool D3D11DrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect channelB
 		D3D11_TEXTURE2D_DESC packDesc{};
 		packDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 		packDesc.BindFlags = 0;
-		packDesc.Width = bw;
-		packDesc.Height = bh;
 		packDesc.ArraySize = 1;
 		packDesc.MipLevels = 1;
 		packDesc.Usage = D3D11_USAGE_STAGING;
 		packDesc.SampleDesc.Count = 1;
+		// The copy below lands at bx, by, and the read starts there, so the texture has to reach that far.
+		packDesc.Width = bx + bw;
+		packDesc.Height = by + bh;
 		switch (channelBits) {
 		case Aspect::COLOR_BIT:
 			packDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;  // TODO: fb->colorFormat;
@@ -1764,6 +1769,9 @@ bool D3D11DrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect channelB
 				return false;
 			}
 			packDesc.Format = fb->depthStencilFormat;
+			// CopyResource below needs the whole size.
+			packDesc.Width = fb->Width();
+			packDesc.Height = fb->Height();
 			break;
 		default:
 			_assert_(false);
@@ -1873,6 +1881,7 @@ bool D3D11DrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect channelB
 }
 
 void D3D11DrawContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) {
+	fbo = PrimaryToNull(fbo);
 	// TODO: deviceContext1 can actually discard.
 	if (fbo) {
 		D3D11Framebuffer *fb = (D3D11Framebuffer *)fbo;
@@ -1970,6 +1979,7 @@ uint64_t D3D11DrawContext::GetNativeObject(NativeObject obj, void *srcObject) {
 }
 
 void D3D11DrawContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) {
+	fbo = PrimaryToNull(fbo);
 	D3D11Framebuffer *fb = (D3D11Framebuffer *)fbo;
 	if (fb) {
 		*w = fb->Width();

@@ -29,11 +29,6 @@
 #undef realloc
 #endif
 
-// Weird issue
-#if PPSSPP_PLATFORM(WINDOWS) && PPSSPP_ARCH(ARM)
-#undef free
-#endif
-
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
 #include "Common/GPU/Shader.h"
@@ -55,7 +50,6 @@
 static EShLanguage GetShLanguageFromStage(const ShaderStage stage) {
 	switch (stage) {
 	case ShaderStage::Vertex: return EShLangVertex;
-	case ShaderStage::Geometry: return EShLangGeometry;
 	case ShaderStage::Fragment: return EShLangFragment;
 	case ShaderStage::Compute: return EShLangCompute;
 	default: return EShLangVertex;

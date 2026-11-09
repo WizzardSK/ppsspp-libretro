@@ -18,16 +18,30 @@ public:
 
 	virtual void Destroy(VulkanContext *vulkan) = 0;
 
+	// Some presentation backends can change their image set while the device remains alive. The
+	// render manager checks this at a safe frame boundary before recording new work.
+	virtual bool NeedsRecreate() const { return false; }
+	// Called after the render manager has stopped submission, waited for the queue, and destroyed
+	// its backbuffer views. The backend must rebuild any images exposed through GetImage().
+	virtual bool Recreate(VulkanContext *) { return true; }
+
 	// Mirrors vkAcquireNextImageKHR: waits for the next image to become available, and signals
 	// signalSemaphore once it's safe to render into it.
 	virtual VkResult AcquireNextImage(VulkanContext *vulkan, VkSemaphore signalSemaphore, uint32_t *imageIndex) = 0;
 	// Mirrors vkQueuePresentKHR: hands the finished image back, waiting on waitSemaphore first.
 	virtual VkResult QueuePresent(VulkanContext *vulkan, VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore) = 0;
 
+	// Called around a queued presentation. Hosts that hand an image to another thread can use this
+	// to keep the caller from invoking its video callback until QueuePresent has completed.
+	virtual void BeginPresent() {}
+	virtual void EndPresent() {}
+
 	virtual uint32_t GetImageCount() const = 0;
 	virtual VkImage GetImage(uint32_t index) const = 0;
 	virtual VkExtent2D GetExtent() const = 0;
 	virtual VkFormat GetFormat() const = 0;
+	// Array layers per image. Two makes the backbuffer pass multiview, one view per layer (VR).
+	virtual uint32_t GetImageLayers() const { return 1; }
 
 	// The layout backbuffer images should be left in after rendering, since there's no real presentation
 	// engine to hand them to via a VK_IMAGE_LAYOUT_PRESENT_SRC_KHR transition.

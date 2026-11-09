@@ -510,6 +510,7 @@ void ControlLayoutView::CreateViews() {
 
 	addDragDropButton(touch.touchSelectKey, "Select button", rectImage, ImageID("I_SELECT"));
 	addDragDropButton(touch.touchStartKey, "Start button", rectImage, ImageID("I_START"));
+	addDragDropButton(touch.touchHomeKey, "Home button", rectImage, ImageID("I_HOME"));
 
 	addDragDropButton(touch.touchFastForwardKey, "Fast-forward button", rectImage, ImageID("I_FAST_FORWARD_LINE"));
 	addDragDropButton(touch.touchLKey, "Left shoulder button", shoulderImage, ImageID("I_L"));
@@ -537,12 +538,7 @@ void ControlLayoutView::CreateViews() {
 
 	for (int i = 0; i < TouchControlConfig::CUSTOM_BUTTON_COUNT; i++) {
 		// Similar to GamepadEmu, we sanitize the images for valid values.
-		if (g_Config.CustomButton[i].shape >= ARRAY_SIZE(CustomKeyData::customKeyShapes)) {
-			g_Config.CustomButton[i].shape = 0;
-		}
-		if (g_Config.CustomButton[i].image >= ARRAY_SIZE(CustomKeyData::customKeyImages)) {
-			g_Config.CustomButton[i].image = 0;
-		}
+		CustomKeyData::Sanitize(g_Config.CustomButton[i]);
 
 		char temp[64];
 		snprintf(temp, sizeof(temp), "Custom %d button", i);
@@ -590,15 +586,26 @@ void TouchControlLayoutScreen::onFinish(DialogResult reason) {
 	g_Config.Save("TouchControlLayoutScreen::onFinish");
 }
 
-void TouchControlLayoutScreen::OnReset(UI::EventParams &e) {
-	INFO_LOG(Log::G3D, "Resetting touch control layout to default.");
+ViewLayoutMode TouchControlLayoutScreen::LayoutMode() const {
+	return TouchControlsLayoutMode();
+}
 
-	const Bounds &bounds = GetLayoutBounds(*screenManager()->getUIContext());
-	const DeviceOrientation orientation = GetDeviceOrientation();
-	TouchControlConfig &touch = g_Config.GetTouchControlsConfig(orientation);
-	touch.ResetLayout();
-	InitPadLayout(&touch, orientation, bounds.w, bounds.h);
-	RecreateViews();
+void TouchControlLayoutScreen::OnReset(UI::EventParams &e) {
+	auto co = GetI18NCategory(I18NCat::CONTROLS);
+	auto di = GetI18NCategory(I18NCat::DIALOG);
+	screenManager()->push(new UI::MessagePopupScreen(di->T("Reset"), co->T("Are you sure you want to reset the touch control layout?"), di->T("Reset"), di->T("Cancel"), [this](bool yes) {
+		if (!yes) {
+			return;
+		}
+		INFO_LOG(Log::G3D, "Resetting touch control layout to default.");
+
+		const Bounds &bounds = GetLayoutBounds(*screenManager()->getUIContext());
+		const DeviceOrientation orientation = GetDeviceOrientation();
+		TouchControlConfig &touch = g_Config.GetTouchControlsConfig(orientation);
+		touch.ResetLayout();
+		InitPadLayout(&touch, orientation, bounds.w, bounds.h);
+		RecreateViews();
+	}));
 };
 
 void TouchControlLayoutScreen::dialogFinished(const Screen *dialog, DialogResult result) {
@@ -642,7 +649,11 @@ void TouchControlLayoutScreen::CreateViews() {
 
 	ScrollView *leftColumnScroll = root_->Add(new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(leftColumnWidth, FILL_PARENT)));
 	leftColumnScroll->SetAlignOpposite(true);
-	LinearLayout *leftColumn = leftColumnScroll->Add(new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(Margins(12.0f, 0.0f))));
+
+	ChoiceGroupList *leftColumn = leftColumnScroll->Add(new ChoiceGroupList());
+
+	// More compact spacing since this is not a full on settings view.
+	leftColumn->SetSpacing(12.0f);
 
 	mode_ = new ChoiceStrip(ORIENT_VERTICAL);
 	mode_->AddChoice(di->T("Move"), ImageID("I_MOVE"));
@@ -654,21 +665,23 @@ void TouchControlLayoutScreen::CreateViews() {
 			layoutView_->mode_ = mode;
 		}
 	});
-
-	CheckBox *snap = new CheckBox(&g_Config.bTouchSnapToGrid, di->T("Snap"));
-	PopupSliderChoice *gridSize = new PopupSliderChoice(&g_Config.iTouchSnapGridSize, 2, 256, 64, di->T("Grid"), screenManager(), "");
-	gridSize->SetEnabledPtr(&g_Config.bTouchSnapToGrid);
+	mode_->SetRoundCorners();
 
 	leftColumn->Add(mode_);
 	leftColumn->Add(new Choice(co->T("Customize")))->OnClick.Add([this](UI::EventParams &e) {
 		screenManager()->push(new TouchControlVisibilityScreen(gamePath_));
 	});
-	leftColumn->Add(snap);
-	leftColumn->Add(gridSize);
+
+	ChoiceGroup *gridControls = leftColumn->Add(new ChoiceGroup());
+	CheckBox *snap = gridControls->Add(new CheckBox(&g_Config.bTouchSnapToGrid, di->T("Snap")));
+	PopupSliderChoice *gridSize = gridControls->Add(new PopupSliderChoice(&g_Config.iTouchSnapGridSize, 2, 256, 64, di->T("Grid"), screenManager(), ""));
+	gridSize->SetEnabledPtr(&g_Config.bTouchSnapToGrid);
+
 	leftColumn->Add(new Choice(di->T("Reset")))->OnClick.Handle(this, &TouchControlLayoutScreen::OnReset);
-	leftColumn->Add(new Spacer(12.0f));
 	leftColumn->Add(new Choice(di->T("Back"), ImageID("I_NAVIGATE_BACK")))->OnClick.Handle<UIScreen>(this, &UIScreen::OnBack);
-	leftColumn->Add(new Spacer(0.0f));
+
+	leftColumn->SetRoundCorners();
+
 	leftColumnScroll->SetShadows(false);
 
 	LinearLayout* rightColumn = root_->Add(new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(1.0f, Margins(0.0f, 12.0f, 12.0f, 12.0f))));

@@ -348,6 +348,7 @@ public:
 		PVR_BAD_16BIT_TEXFORMATS = 14,
 		NO_DEPTH_CANNOT_DISCARD_STENCIL_MALI = 15,
 		EMPTY_RENDERPASS_BROKEN_MALI = 16,
+		PVR_UNUSED_DYNAMIC_UBO_OVERRUN = 17,
 		MAX_BUG,
 	};
 
@@ -450,12 +451,42 @@ public:
 	int Height() const { return height_; }
 	int Layers() const { return layers_; }
 	int MultiSampleLevel() const { return multiSampleLevel_; }
+	bool HasDepthStencil() const { return hasDepthStencil_; }
 
 	virtual void UpdateTag(const char *tag) {}
 	virtual const char *Tag() const { return "(no name)"; }
+	virtual bool IsSwapchain() const { return false; }
 
 protected:
 	int width_ = -1, height_ = -1, layers_ = 1, multiSampleLevel_ = 0;
+	bool hasDepthStencil_ = false;
+};
+
+// Something we present to other than the primary backbuffer, like a second window or an external display.
+// Render to it and read it back like a Framebuffer, but don't texture or blit from it. Its size follows
+// the surface (see ResizeSwapchain). Created and destroyed through the DrawContext.
+class Swapchain : public Framebuffer {
+public:
+	bool IsSwapchain() const override { return true; }
+};
+
+// The backbuffer, which every DrawContext has. The backends keep its size.
+class PrimarySwapchain : public Swapchain {
+public:
+	void SetSize(int width, int height) {
+		width_ = width;
+		height_ = height;
+	}
+	const char *Tag() const override { return "BackBuffer"; }
+};
+
+struct SwapchainDesc {
+	WindowSystem winsys;
+	void *data1;  // Like GraphicsContext::InitSurface. For WINDOWSYSTEM_METAL_EXT, the CAMetalLayer.
+	void *data2;
+	int width;  // In pixels.
+	int height;
+	const char *tag;
 };
 
 class Buffer : public RefCountedObject {
@@ -600,7 +631,6 @@ struct DeviceCaps {
 
 	bool anisoSupported;
 	bool depthRangeMinusOneToOne;  // OpenGL style depth
-	bool tesselationShaderSupported;
 	bool dualSourceBlend;
 	bool logicOpSupported;
 	bool depthClampSupported;
@@ -608,6 +638,7 @@ struct DeviceCaps {
 	bool framebufferBlitSupported;
 	bool framebufferDepthCopySupported;
 	bool framebufferSeparateDepthCopySupported;
+	bool framebufferSampleReadSupported = false;  // BindFramebufferSamplesAsTexture works.
 	bool framebufferDepthBlitSupported;
 	bool framebufferStencilBlitSupported;
 	bool framebufferFetchSupported;
@@ -628,6 +659,7 @@ struct DeviceCaps {
 	bool verySlowShaderCompiler;
 	bool fullScreenExclusiveSupported;
 	bool samplerLodControl;
+	bool samplerLodBias = true;  // False if a sampler's LOD bias is ignored (MoltenVK, the portability subset's samplerMipLodBias).
 
 	// Old style, for older GL or Direct3D 9.
 	u32 clipPlanesSupported;
@@ -636,6 +668,7 @@ struct DeviceCaps {
 	int presentMaxInterval; // 1 on many backends
 	bool presentInstantModeChange;
 	PresentMode presentModesSupported;
+	bool multipleSwapchains = false;  // CreateSwapchain works.
 
 	u32 multiSampleLevelsMask;  // Bit n is set if (1 << n) is a valid multisample level. Bit 0 is always set.
 	std::string deviceName;  // The device name to use when creating the thin3d context, to get the same one.
@@ -667,6 +700,18 @@ struct TextureDesc {
 	// Does not take ownership over pointed-to data.
 	std::vector<const uint8_t *> initData;
 	TextureCallback initDataCallback;
+};
+
+// A rectangular piece of a single mip level, for DrawContext::UpdateTextureRegions.
+struct TextureRegionUpdate {
+	int x;
+	int y;
+	int w;
+	int h;
+	// Points at the top left pixel of the region. Does not take ownership.
+	const uint8_t *data;
+	// Distance between rows in data, in bytes. 0 means tightly packed, that is w pixels.
+	int byteStride;
 };
 
 enum class RPAction {
@@ -722,7 +767,10 @@ struct ClippedDraw {
 
 class DrawContext {
 public:
-	virtual ~DrawContext() = default;
+	DrawContext() : primarySwapchain_(new PrimarySwapchain()) {}
+	virtual ~DrawContext() {
+		primarySwapchain_->Release();
+	}
 	bool CreatePresets();
 	void DestroyPresets();
 
@@ -790,6 +838,10 @@ public:
 	// while in Vulkan this might cause various strangeness like image corruption.
 	virtual void UpdateTextureLevels(Texture *texture, const uint8_t **data, TextureCallback initDataCallback, int numLevels) = 0;
 
+	// Replaces a set of rectangular regions of a single mip level, leaving the rest of the texture alone.
+	// Same in-flight caveat as UpdateTextureLevels. The regions must not overlap each other.
+	virtual void UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) = 0;
+
 	virtual void CopyFramebufferImage(Framebuffer *src, int level, int x, int y, int z, Framebuffer *dst, int dstLevel, int dstX, int dstY, int dstZ, int width, int height, int depth, Aspect aspects, const char *tag) = 0;
 	virtual bool BlitFramebuffer(Framebuffer *src, int srcX1, int srcY1, int srcX2, int srcY2, Framebuffer *dst, int dstX1, int dstY1, int dstX2, int dstY2, Aspect aspects, FBBlitFilter filter, const char *tag) = 0;
 
@@ -801,13 +853,30 @@ public:
 		return DataFormat::R8G8B8A8_UNORM;
 	}
 
+	// The backbuffer. Bind it, measure it and read it back like any other swapchain. Where a Framebuffer
+	// is taken, nullptr also means the backbuffer.
+	Swapchain *GetPrimarySwapchain() const { return primarySwapchain_; }
+
+	// Additional swapchains, presented along with the backbuffer by Present(). Create and destroy them
+	// between frames, on the thread that renders. Check caps.multipleSwapchains.
+	virtual Swapchain *CreateSwapchain(const SwapchainDesc &desc, std::string *error) {
+		*error = "Not supported";
+		return nullptr;
+	}
+	virtual void DestroySwapchain(Swapchain *swapchain) {}
+	virtual void ResizeSwapchain(Swapchain *swapchain, int width, int height) {}
+
 	// These functions should be self explanatory.
-	// Binding a zero render target means binding the backbuffer.
+	// A Swapchain (the backbuffer included) can be bound like a framebuffer, once per frame, and is presented
+	// by Present().
 	// If an fbo has two layers, we bind for stereo rendering ALWAYS. There's no rendering to one layer anymore.
 	virtual void BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) = 0;
 
 	// binding must be < MAX_TEXTURE_SLOTS (0, 1 are okay if it's 2).
 	virtual void BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect aspect, int layer) = 0;
+	// Binds a multisampled framebuffer's color samples, for texelFetch from a sampler with SamplerFlags::MULTISAMPLE.
+	// Check framebufferSampleReadSupported.
+	virtual void BindFramebufferSamplesAsTexture(Framebuffer *fbo, int binding, int layer) {}
 
 	// Framebuffer fetch / input attachment support, needs to be explicit in Vulkan.
 	virtual void BindCurrentFramebufferForColorInput() {}
@@ -911,6 +980,12 @@ public:
 	}
 
 protected:
+	// The backends' backbuffer code goes by nullptr.
+	Framebuffer *PrimaryToNull(Framebuffer *fb) const {
+		return fb == primarySwapchain_ ? nullptr : fb;
+	}
+
+	PrimarySwapchain *primarySwapchain_;
 	HistoryBuffer<FrameTimeData, FRAME_TIME_HISTORY_LENGTH> frameTimeHistory_;
 
 	ShaderModule *vsPresets_[VS_MAX_PRESET]{};

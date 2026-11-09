@@ -10,11 +10,17 @@
 #include <GLES2/gl2ext.h>
 #define GL_BGRA_EXT 0x80E1
 #else // OpenGL
+#if PPSSPP_PLATFORM(SWITCH)
+// libnx has no GLEW. GLSwitch.h declares the same entry points and they get
+// resolved through eglGetProcAddress instead - see LibretroGLContext.
+#include "Common/GPU/OpenGL/GLSwitch.h"
+#else
 #include "GL/glew.h"
 #if defined(__APPLE__)
 #include <OpenGL/gl.h>
 #else
 #include <GL/gl.h>
+#endif
 #endif
 #endif
 
@@ -33,6 +39,11 @@
 
 #ifndef GL_MAX_EXT
 #define GL_MAX_EXT 0x8008
+#endif
+
+#ifndef GL_DEPTH_CLAMP
+// GL_DEPTH_CLAMP_EXT, from GL_EXT_depth_clamp. Not in every platform header.
+#define GL_DEPTH_CLAMP 0x864F
 #endif
 
 #if defined(__ANDROID__)
@@ -57,6 +68,14 @@ typedef void (EGLAPIENTRYP PFNGLBLITFRAMEBUFFERNVPROC) (
 	GLbitfield mask, GLenum filter);
 #endif
 extern PFNGLBLITFRAMEBUFFERNVPROC glBlitFramebufferNV;
+
+#ifndef GL_ZERO_TO_ONE_EXT
+#define GL_LOWER_LEFT_EXT 0x8CA1
+#define GL_ZERO_TO_ONE_EXT 0x935F
+#endif
+// Our own name for the type and the pointer, since not every NDK header declares GL_EXT_clip_control.
+typedef void (GL_APIENTRYP PPSSPP_PFNGLCLIPCONTROLEXTPROC) (GLenum origin, GLenum depth);
+extern PPSSPP_PFNGLCLIPCONTROLEXTPROC glClipControlEXTFunc;
 
 #if PPSSPP_PLATFORM(IOS)
 extern PFNGLDISCARDFRAMEBUFFEREXTPROC glDiscardFramebufferEXT;

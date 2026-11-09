@@ -28,6 +28,7 @@ SDLJoystick *joystick = NULL;
 #include "Common/System/System.h"
 #include "Common/System/Request.h"
 #include "Common/System/NativeApp.h"
+#include "Common/GPU/thin3d.h"
 #include "Common/Audio/AudioBackend.h"
 #include "Core/CmdLine.h"
 #include "Core/EmuThread.h"
@@ -66,6 +67,7 @@ SDLJoystick *joystick = NULL;
 #include "Core/Core.h"
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
+#include "Core/HLE/sceUsbMic.h"
 #include "SDLGLGraphicsContext.h"
 #include "SDLUtil.h"
 
@@ -74,6 +76,8 @@ SDLJoystick *joystick = NULL;
 #if PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS)
 #include "Core/Util/DarwinFileSystemServices.h"
 #include "SDL/SDLCocoaMetalLayer.h"
+#include "Common/GPU/Metal/MetalGraphicsContext.h"
+#include <SDL3/SDL_metal.h>
 #endif
 
 #if PPSSPP_PLATFORM(MAC)
@@ -87,6 +91,10 @@ extern u32 __nx_applet_type; // Not exposed through a header?
 
 GlobalUIState lastUIState = UISTATE_MENU;
 GlobalUIState GetUIState();
+
+// How long the cursor stays visible after the mouse stops moving, when auto-hiding it.
+static constexpr double CURSOR_HIDE_DELAY = 0.5;
+static double g_lastCursorMoveTime = 0.0;
 
 static bool g_QuitRequested = false;
 static bool g_RestartRequested = false;
@@ -103,6 +111,10 @@ static int g_audioFramesPerBuffer = 0;
 
 static bool g_textFocusChanged;
 static bool g_textFocus;
+// Set when SDL_StartTextInput fails, so we generate KeyInputFlags::CHAR from key events ourselves.
+// SDL 3.4.0 to 3.4.4 refuse text input on Wayland compositors without zwp_text_input_v3 (like WSLg's Weston).
+static bool g_textInputFallback;
+static bool g_dropBootedFile = false;
 double g_audioStartTime = 0.0;
 
 // Window state to be transferred to the main SDL thread.
@@ -117,7 +129,8 @@ struct WindowState {
 static WindowState g_windowState;
 
 #if !PPSSPP_PLATFORM(MAC)
-static int g_batteryPercent = 0;
+// -1 until polled, or without a battery.
+static int g_batteryPercent = -1;
 #endif
 
 #if PPSSPP_PLATFORM(MAC)
@@ -520,6 +533,87 @@ static void sdl_mixaudio_callback(void *userdata, SDL_AudioStream *stream, int a
 static SDL_AudioDeviceID audioDev = 0;
 static SDL_AudioStream *audioStream = nullptr;
 
+static std::mutex micMutex;
+static SDL_AudioStream *micStream = nullptr;
+static SDL_AudioSpec micFormat{};
+static std::atomic<bool> micDeviceChanged{false};
+static std::atomic<SDL_AudioDeviceID> micDevice{0};
+static std::atomic<SDL_AudioDeviceID> micPhysicalDevice{0};
+
+static void sdl_mic_callback(void *userdata, SDL_AudioStream *stream, int, int) {
+	const SDL_AudioSpec *format = static_cast<const SDL_AudioSpec *>(userdata);
+	// Bound capture buffering while emulation is paused.
+	if (SDL_GetAudioStreamAvailable(stream) > format->freq * format->channels * (int)sizeof(int16_t)) {
+		SDL_ClearAudioStream(stream);
+	}
+}
+
+// micMutex must be held. The callback only touches its SDL stream.
+static void StopSDLMicrophone() {
+	micDevice = 0;
+	micPhysicalDevice = 0;
+	if (micStream) {
+		SDL_DestroyAudioStream(micStream);
+		micStream = nullptr;
+	}
+}
+
+static void StartSDLMicrophone(int sampleRate) {
+	StopSDLMicrophone();
+	Microphone::flushAudioData();
+	micFormat.freq = sampleRate;
+	micFormat.format = SDL_AUDIO_S16;
+	micFormat.channels = 1;
+	micDeviceChanged = false;
+
+	int count = 0;
+	SDL_AudioDeviceID *devices = SDL_GetAudioRecordingDevices(&count);
+	SDL_AudioDeviceID selected = SDL_AUDIO_DEVICE_DEFAULT_RECORDING;
+	for (int i = 0; i < count; i++) {
+		const char *name = SDL_GetAudioDeviceName(devices[i]);
+		if (name && g_Config.sMicDevice == name) {
+			selected = devices[i];
+			break;
+		}
+	}
+	SDL_free(devices);
+
+	micStream = SDL_OpenAudioDeviceStream(selected, &micFormat, sdl_mic_callback, &micFormat);
+	if (!micStream && selected != SDL_AUDIO_DEVICE_DEFAULT_RECORDING) {
+		WARN_LOG(Log::Audio, "Could not open microphone '%s': %s. Trying default.", g_Config.sMicDevice.c_str(), SDL_GetError());
+		micStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &micFormat, sdl_mic_callback, &micFormat);
+		selected = SDL_AUDIO_DEVICE_DEFAULT_RECORDING;
+	}
+	if (!micStream || !SDL_ResumeAudioStreamDevice(micStream)) {
+		ERROR_LOG(Log::Audio, "Could not start microphone: %s", SDL_GetError());
+		StopSDLMicrophone();
+		return;
+	}
+	micDevice = SDL_GetAudioStreamDevice(micStream);
+	micPhysicalDevice = selected;
+	INFO_LOG(Log::Audio, "Microphone started at %d Hz", sampleRate);
+}
+
+static void PollSDLMicrophone() {
+	if (micDeviceChanged.exchange(false)) {
+		StartSDLMicrophone(micFormat.freq);
+	}
+	if (!micStream) {
+		return;
+	}
+
+	// Called on the CPU thread; the SDL capture callback never accesses PSP memory.
+	u8 samples[4096];
+	int bytes;
+	while ((bytes = SDL_GetAudioStreamData(micStream, samples, sizeof(samples))) > 0) {
+		Microphone::addAudioData(samples, bytes);
+	}
+	if (bytes < 0) {
+		ERROR_LOG(Log::Audio, "Could not read microphone: %s", SDL_GetError());
+		StopSDLMicrophone();
+	}
+}
+
 // Must be called after NativeInit().
 static void InitSDLAudioDevice(const std::string &name = "") {
 	SDL_AudioSpec fmt{};
@@ -650,8 +744,8 @@ AudioBackend *System_CreateAudioBackend() {
 static void InitializeFilters(std::vector<std::string> &filters, BrowseFileType type) {
 	switch (type) {
 	case BrowseFileType::BOOTABLE:
-		filters.push_back("All supported file types (*.iso *.cso *.chd *.pbp *.elf *.prx *.zip *.ppdmp)");
-		filters.push_back("*.pbp *.elf *.iso *.cso *.chd *.prx *.zip *.ppdmp");
+		filters.push_back("All supported file types (*.iso *.cso *.chd *.pbp *.elf *.prx *.zip *.ppdmp *.cue *.ccd *.mds *.mdf *.bin *.img)");
+		filters.push_back("*.pbp *.elf *.iso *.cso *.chd *.prx *.zip *.ppdmp *.cue *.ccd *.mds *.mdf *.bin *.img");
 		break;
 	case BrowseFileType::SAVE_STATE:
 		filters.push_back("Save state files (*.ppst)");
@@ -695,6 +789,17 @@ static void InitializeFilters(std::vector<std::string> &filters, BrowseFileType 
 	filters.push_back("All files (*.*)");
 	filters.push_back("*");
 }
+
+#if PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID)
+// Opens a file or folder in whatever the desktop associates with it, without blocking the caller.
+static void LaunchXdgOpen(const std::string &path) {
+	pid_t pid = fork();
+	if (pid == 0) {
+		execlp("xdg-open", "xdg-open", path.c_str(), nullptr);
+		_exit(1);
+	}
+}
+#endif
 
 bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) {
 	switch (type) {
@@ -866,14 +971,7 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 #elif PPSSPP_PLATFORM(MAC)
 		OSXShowInFinder(param1.c_str());
 #elif (PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID))
-		pid_t pid = fork();
-		if (pid < 0)
-			return true;
-
-		if (pid == 0) {
-			execlp("xdg-open", "xdg-open", param1.c_str(), nullptr);
-			exit(1);
-		}
+		LaunchXdgOpen(param1);
 #endif /* PPSSPP_PLATFORM(WINDOWS) */
 		return true;
 	}
@@ -899,6 +997,26 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 		}
 		return true;
 	}
+	case SystemRequestType::MICROPHONE_COMMAND:
+	{
+		std::lock_guard<std::mutex> guard(micMutex);
+		if (startsWith(param1, "startRecording:")) {
+			int sampleRate = 0;
+			if (sscanf(param1.c_str(), "startRecording:%d", &sampleRate) != 1 || sampleRate <= 0) {
+				return false;
+			}
+			StartSDLMicrophone(sampleRate);
+		} else if (param1 == "stopRecording") {
+			StopSDLMicrophone();
+		} else if (param1 == "pollRecording") {
+			PollSDLMicrophone();
+		} else if (param1 == "deviceChanged") {
+			micDeviceChanged = true;
+		} else {
+			return false;
+		}
+		return true;
+	}
 	case SystemRequestType::NOTIFY_UI_EVENT:
 	{
 		switch ((UIEventNotification)param3) {
@@ -906,7 +1024,6 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 			g_textFocus = true;
 			g_textFocusChanged = true;
 			break;
-		case UIEventNotification::POPUP_CLOSED:
 		case UIEventNotification::TEXT_LOSTFOCUS:
 			g_textFocus = false;
 			g_textFocusChanged = true;
@@ -941,7 +1058,6 @@ std::vector<std::string> System_GetCameraDeviceList() {
 void System_LaunchUrl(LaunchUrlType urlType, std::string_view url) {
 	switch (urlType) {
 	case LaunchUrlType::BROWSER_URL:
-	case LaunchUrlType::MARKET_URL:
 	{
 #if PPSSPP_PLATFORM(SWITCH)
 		Uuid uuid = { 0 };
@@ -955,8 +1071,11 @@ void System_LaunchUrl(LaunchUrlType urlType, std::string_view url) {
 		ShellExecute(NULL, L"open", wurl.c_str(), NULL, NULL, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
 		OSXOpenURL(std::string(url).c_str());
+#elif PPSSPP_PLATFORM(LINUX)
+		// Not through a shell: the URL can come from the game.
+		LaunchXdgOpen(std::string(url));
 #else
-		std::string command = join("xdg-open ", url);
+		std::string command = "xdg-open '" + ReplaceAll(url, "'", "'\\''") + "'";
 		int err = system(command.c_str());
 		if (err) {
 			INFO_LOG(Log::System, "Would have gone to %.*s but xdg-utils seems not to be installed", STR_VIEW(url));
@@ -986,6 +1105,8 @@ void System_LaunchUrl(LaunchUrlType urlType, std::string_view url) {
 #if defined(__APPLE__)
 		// If it's a folder and we're on a mac, open it in finder.
 		OSXShowInFinder(std::string(url).c_str());
+#elif PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID)
+		LaunchXdgOpen(std::string(url));
 #endif
 		// INFO_LOG(Log::System, "LaunchUrlType::LOCAL_FILE not implemented on this platform");
 		break;
@@ -997,6 +1118,10 @@ void System_LaunchUrl(LaunchUrlType urlType, std::string_view url) {
 
 std::string System_GetProperty(SystemProperty prop) {
 	switch (prop) {
+#if PPSSPP_PLATFORM(MAC)
+	case SYSPROP_DEVICE_MODEL:
+		return "Mac";
+#endif
 	case SYSPROP_NAME:
 #ifdef _WIN32
 		return "SDL:Windows";
@@ -1074,6 +1199,19 @@ std::vector<std::string> System_GetPropertyStringVec(SystemProperty prop) {
 	std::vector<std::string> result;
 
 	switch (prop) {
+	case SYSPROP_MICROPHONE_DEVICE_LIST:
+	{
+		int count = 0;
+		SDL_AudioDeviceID *devices = SDL_GetAudioRecordingDevices(&count);
+		for (int i = 0; i < count; i++) {
+			const char *name = SDL_GetAudioDeviceName(devices[i]);
+			if (name) {
+				result.emplace_back(name);
+			}
+		}
+		SDL_free(devices);
+		return result;
+	}
 	case SYSPROP_TEMP_DIRS:
 		if (getenv("TMPDIR") && strlen(getenv("TMPDIR")) != 0)
 			result.push_back(getenv("TMPDIR"));
@@ -1161,12 +1299,20 @@ float System_GetPropertyFloat(SystemProperty prop) {
 
 bool System_GetPropertyBool(SystemProperty prop) {
 	switch (prop) {
+	case SYSPROP_MICROPHONE_NEEDS_POLLING:
+		return true;
 	case SYSPROP_HAS_TEXT_CLIPBOARD:
 	case SYSPROP_CAN_SHOW_FILE:
 #if PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(MAC) || (PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID))
 		return true;
 #else
 		return false;
+#endif
+	case SYSPROP_CAN_LAUNCH_URL:
+#if defined(MOBILE_DEVICE) && !PPSSPP_PLATFORM(SWITCH)
+		return false;
+#else
+		return true;
 #endif
 	case SYSPROP_HAS_OPEN_DIRECTORY:
 #if PPSSPP_PLATFORM(WINDOWS)
@@ -1194,7 +1340,8 @@ bool System_GetPropertyBool(SystemProperty prop) {
 		return true;  // FileUtil.cpp: OpenFileInEditor
 #ifndef HTTPS_NOT_AVAILABLE
 	case SYSPROP_SUPPORTS_HTTPS:
-		return !g_Config.bDisableHTTPS;
+		// On Linux this also depends on whether libcurl could be loaded.
+		return !g_Config.bDisableHTTPS && net::HTTPSAvailable();
 #endif
 case SYSPROP_HAS_FOLDER_BROWSER:
 case SYSPROP_HAS_FILE_BROWSER:
@@ -1296,10 +1443,111 @@ void UpdateCursor() {
 	SDL_SetCursor(g_builtinCursors[(int)curCursor]);
 }
 
+// --game-window: a second window showing just the game. For now it's only a way to test multiple outputs on
+// the desktop, standing in for a TV over AirPlay. Later, real multi-window support (like ImGui's multi-viewports)
+// will take this over.
+static SDL_Window *g_gameWindow = nullptr;
+static int g_gameOutputId = 0;
+
+static void CreateGameWindow() {
+	Draw::SwapchainDesc desc{};
+	desc.tag = "GameWindow";
+	const GPUBackend backend = (GPUBackend)g_Config.iGPUBackend;
+	if (backend == GPUBackend::VULKAN) {
+		g_gameWindow = SDL_CreateWindow("PPSSPP game", 960, 544, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+		WindowDesc windowDesc{};
+		std::string error;
+		if (g_gameWindow && !DetermineVulkanWindowSystem(g_gameWindow, &windowDesc, &error)) {
+			fprintf(stderr, "Can't use the game window: %s\n", error.c_str());
+			SDL_DestroyWindow(g_gameWindow);
+			g_gameWindow = nullptr;
+			return;
+		}
+		desc.winsys = windowDesc.winsys;
+		desc.data1 = windowDesc.data1;
+		desc.data2 = windowDesc.data2;
+#if PPSSPP_PLATFORM(MAC)
+	} else if (backend == GPUBackend::METAL) {
+		g_gameWindow = SDL_CreateWindow("PPSSPP game", 960, 544, SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+		if (g_gameWindow) {
+			desc.winsys = WINDOWSYSTEM_METAL_EXT;
+			desc.data1 = SDL_Metal_GetLayer(SDL_Metal_CreateView(g_gameWindow));
+		}
+#endif
+	} else {
+		// TODO: Windows (D3D11) and OpenGL.
+		fprintf(stderr, "--game-window needs Vulkan, or Metal on Mac\n");
+		return;
+	}
+	if (!g_gameWindow) {
+		fprintf(stderr, "Error creating the game window: %s\n", SDL_GetError());
+		return;
+	}
+	SDL_GetWindowSizeInPixels(g_gameWindow, &desc.width, &desc.height);
+	g_gameOutputId = Native_AddOutput(OutputRole::Game, desc);
+}
+
+// Returns true if the event was for the game window, and has been handled. Keys still go to the emulator.
+static bool ProcessGameWindowEvent(const SDL_Event &event) {
+	if (!g_gameWindow || SDL_GetWindowFromEvent(&event) != g_gameWindow) {
+		return false;
+	}
+	switch (event.type) {
+	case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+		Native_ResizeOutput(g_gameOutputId, event.window.data1, event.window.data2);
+		return true;
+	case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+		// The layer has to outlive the swapchain, so the window stays until we quit.
+		Native_RemoveOutput(g_gameOutputId);
+		SDL_HideWindow(g_gameWindow);
+		return true;
+	case SDL_EVENT_KEY_DOWN:
+	case SDL_EVENT_KEY_UP:
+	case SDL_EVENT_TEXT_INPUT:
+		return false;
+	default:
+		// Window events, and the mouse, which the UI in the main window would get the coordinates wrong for.
+		return true;
+	}
+}
+
 static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputStateTracker *inputTracker) {
+	if (ProcessGameWindowEvent(event)) {
+		return;
+	}
+#if PPSSPP_PLATFORM(MAC)
+	// The file panel sheet doesn't stop SDL from delivering input to the window under it.
+	// Releases still go through, so nothing gets stuck down.
+	if (DarwinIsPanelOpen()) {
+		switch (event.type) {
+		case SDL_EVENT_KEY_DOWN:
+		case SDL_EVENT_TEXT_INPUT:
+		case SDL_EVENT_FINGER_DOWN:
+		case SDL_EVENT_FINGER_MOTION:
+		case SDL_EVENT_MOUSE_BUTTON_DOWN:
+		case SDL_EVENT_MOUSE_MOTION:
+		case SDL_EVENT_MOUSE_WHEEL:
+			return;
+		default:
+			break;
+		}
+	}
+#endif
+	// SDL input uses window coordinates; convert to pixels before applying the UI scale.
+	float inputPixelDensity = SDL_GetWindowPixelDensity(window);
+	if (inputPixelDensity <= 0.0f) {
+		inputPixelDensity = 1.0f;
+	}
 	switch (event.type) {
 	case SDL_EVENT_QUIT:
 		g_QuitRequested = 1;
+		break;
+
+	case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+		// SDL only sends a quit when the last window closes, and --game-window's may still be open.
+		if (SDL_GetWindowFromEvent(&event) == window) {
+			g_QuitRequested = 1;
+		}
 		break;
 
 	#if !defined(MOBILE_DEVICE)
@@ -1330,12 +1578,7 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 				g_Config.iWindowWidth = windowWidth;
 				g_Config.iWindowHeight = windowHeight;
 			}
-			// Hide/Show cursor correctly toggling fullscreen
-			if (lastUIState == UISTATE_INGAME && fullscreen && !g_Config.bShowTouchControls) {
-				SDL_HideCursor();
-			} else if (lastUIState != UISTATE_INGAME || !fullscreen) {
-				SDL_ShowCursor();
-			}
+			// The cursor visibility is handled by UpdateSDLCursor, which runs every frame.
 			break;
 		}
 	case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
@@ -1392,6 +1635,17 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 #endif
 	case SDL_EVENT_KEY_DOWN:
 		{
+			if (g_textInputFallback && g_textFocus && !(event.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
+				// Layout-aware, with shift applied. Repeats are wanted here, like real text input.
+				SDL_Keycode c = SDL_GetKeyFromScancode(event.key.scancode, event.key.mod, false);
+				if (c >= 0x20 && c != 0x7F && !(c & SDLK_SCANCODE_MASK)) {
+					KeyInput key;
+					key.flags = KeyInputFlags::CHAR;
+					key.unicodeChar = c;
+					key.deviceId = DEVICE_ID_KEYBOARD;
+					NativeKey(key);
+				}
+			}
 			if (event.key.repeat > 0) {
 				break;
 			}
@@ -1467,8 +1721,8 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 			SDL_GetWindowSize(window, &w, &h);
 			TouchInput input{};
 			input.id = event.tfinger.fingerID;
-			input.x = event.tfinger.x * w * g_DesktopDPI * g_display.dpi_scale_x;
-			input.y = event.tfinger.y * h * g_DesktopDPI * g_display.dpi_scale_y;
+			input.x = event.tfinger.x * w * inputPixelDensity * g_display.dpi_scale_x;
+			input.y = event.tfinger.y * h * inputPixelDensity * g_display.dpi_scale_y;
 			input.flags = TouchInputFlags::MOVE;
 			input.timestamp = event.tfinger.timestamp;
 			NativeTouch(input);
@@ -1480,8 +1734,8 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 			SDL_GetWindowSize(window, &w, &h);
 			TouchInput input{};
 			input.id = event.tfinger.fingerID;
-			input.x = event.tfinger.x * w * g_DesktopDPI * g_display.dpi_scale_x;
-			input.y = event.tfinger.y * h * g_DesktopDPI * g_display.dpi_scale_y;
+			input.x = event.tfinger.x * w * inputPixelDensity * g_display.dpi_scale_x;
+			input.y = event.tfinger.y * h * inputPixelDensity * g_display.dpi_scale_y;
 			input.flags = TouchInputFlags::DOWN;
 			input.timestamp = event.tfinger.timestamp;
 			NativeTouch(input);
@@ -1499,8 +1753,8 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 			SDL_GetWindowSize(window, &w, &h);
 			TouchInput input{};
 			input.id = event.tfinger.fingerID;
-			input.x = event.tfinger.x * w * g_DesktopDPI * g_display.dpi_scale_x;
-			input.y = event.tfinger.y * h * g_DesktopDPI * g_display.dpi_scale_y;
+			input.x = event.tfinger.x * w * inputPixelDensity * g_display.dpi_scale_x;
+			input.y = event.tfinger.y * h * inputPixelDensity * g_display.dpi_scale_y;
 			input.flags = TouchInputFlags::UP;
 			input.timestamp = event.tfinger.timestamp;
 			NativeTouch(input);
@@ -1517,13 +1771,8 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 		switch (event.button.button) {
 		case SDL_BUTTON_LEFT:
 			{
-				// We have to juggle around 3 kinds of "DPI spaces" if a logical DPI is
-				// provided (through --dpi, it is equal to system DPI if unspecified):
-				// - SDL gives us motion events in "system DPI" points
-				// - Native_UpdateScreenScale expects pixels, so in a way "96 DPI" points
-				// - The UI code expects motion events in "logical DPI" points
-				float mx = event.button.x * g_DesktopDPI * g_display.dpi_scale_x;
-				float my = event.button.y * g_DesktopDPI * g_display.dpi_scale_y;
+				float mx = event.button.x * inputPixelDensity * g_display.dpi_scale_x;
+				float my = event.button.y * inputPixelDensity * g_display.dpi_scale_y;
 				inputTracker->mouseDown |= 1;
 				TouchInput input{};
 				input.x = mx;
@@ -1538,8 +1787,8 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 			break;
 		case SDL_BUTTON_RIGHT:
 			{
-				float mx = event.button.x * g_DesktopDPI * g_display.dpi_scale_x;
-				float my = event.button.y * g_DesktopDPI * g_display.dpi_scale_y;
+				float mx = event.button.x * inputPixelDensity * g_display.dpi_scale_x;
+				float my = event.button.y * inputPixelDensity * g_display.dpi_scale_y;
 				inputTracker->mouseDown |= 2;
 				TouchInput input{};
 				input.x = mx;
@@ -1577,14 +1826,23 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 			KeyInput key{};
 			key.deviceId = DEVICE_ID_MOUSE;
 			key.flags = KeyInputFlags::DOWN;
-			float wheelY = event.wheel.y;
-			if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
-				wheelY = -wheelY;
-			}
+			// SDL has already applied the OS's natural scrolling setting (direction just says whether
+			// it did), so don't undo it.
+			const float wheelY = event.wheel.y;
 			if (wheelY != 0.0f) {
-				const float scale = 30.0f;
+				// wheel.y is in notches.
+				float scale = (float)WHEEL_DELTA_PER_NOTCH;
+#if PPSSPP_PLATFORM(MAC)
+				// A trackpad reports how far the fingers moved, which SDL scales into rough notches
+				// that scroll about twice as far as they should. There's no telling a trackpad from
+				// a wheel here, so a mouse wheel gets the same.
+				scale *= 0.5f;
+#endif
 				key.keyCode = wheelY > 0 ? NKCODE_EXT_MOUSEWHEEL_UP : NKCODE_EXT_MOUSEWHEEL_DOWN;
 				key.flags |= KeyInputFlags::HAS_WHEEL_DELTA;
+				if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
+					key.flags |= KeyInputFlags::WHEEL_FLIPPED;
+				}
 				int wheelDelta = (int)(fabsf(wheelY) * scale);
 				key.flags = (KeyInputFlags)((u32)key.flags | (wheelDelta << 16));
 				NativeKey(key);
@@ -1594,8 +1852,8 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 		}
 	case SDL_EVENT_MOUSE_MOTION:
 		{
-			float mx = event.motion.x * g_DesktopDPI * g_display.dpi_scale_x;
-			float my = event.motion.y * g_DesktopDPI * g_display.dpi_scale_y;
+			float mx = event.motion.x * inputPixelDensity * g_display.dpi_scale_x;
+			float my = event.motion.y * inputPixelDensity * g_display.dpi_scale_y;
 			TouchInput input{};
 			input.x = mx;
 			input.y = my;
@@ -1605,6 +1863,11 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 			NativeTouch(input);
 			NativeMouseDelta(event.motion.xrel, event.motion.yrel);
 
+			// Require a bit of movement to un-hide the cursor, so that jitter doesn't keep it up.
+			if (fabsf(event.motion.xrel) > 1.0f || fabsf(event.motion.yrel) > 1.0f) {
+				g_lastCursorMoveTime = time_now_d();
+			}
+
 			UpdateCursor();
 			break;
 		}
@@ -1612,8 +1875,8 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 		switch (event.button.button) {
 		case SDL_BUTTON_LEFT:
 			{
-				float mx = event.button.x * g_DesktopDPI * g_display.dpi_scale_x;
-				float my = event.button.y * g_DesktopDPI * g_display.dpi_scale_y;
+				float mx = event.button.x * inputPixelDensity * g_display.dpi_scale_x;
+				float my = event.button.y * inputPixelDensity * g_display.dpi_scale_y;
 				inputTracker->mouseDown &= ~1;
 				TouchInput input{};
 				input.x = mx;
@@ -1627,8 +1890,8 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 			break;
 		case SDL_BUTTON_RIGHT:
 			{
-				float mx = event.button.x * g_DesktopDPI * g_display.dpi_scale_x;
-				float my = event.button.y * g_DesktopDPI * g_display.dpi_scale_y;
+				float mx = event.button.x * inputPixelDensity * g_display.dpi_scale_x;
+				float my = event.button.y * inputPixelDensity * g_display.dpi_scale_y;
 				inputTracker->mouseDown &= ~2;
 				// Right button only emits mouse move events. This is weird,
 				// but consistent with Windows. Needs cleanup.
@@ -1664,6 +1927,9 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 		break;
 
 	case SDL_EVENT_AUDIO_DEVICE_ADDED:
+		if (event.adevice.recording && SDL_IsAudioDevicePhysical(event.adevice.which)) {
+			micDeviceChanged = true;
+		}
 		// Automatically switch to the new device.
 		if (!event.adevice.recording) {
 			const char *name = SDL_GetAudioDeviceName(event.adevice.which);
@@ -1687,10 +1953,24 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 		}
 		break;
 	case SDL_EVENT_AUDIO_DEVICE_REMOVED:
+		if (event.adevice.recording && (event.adevice.which == micDevice || event.adevice.which == micPhysicalDevice)) {
+			micDeviceChanged = true;
+		}
 		if (!event.adevice.recording && event.adevice.which == audioDev) {
 			StopSDLAudioDevice();
 			INFO_LOG(Log::Audio, "Audio device removed, reselecting");
 			InitSDLAudioDevice();
+		}
+		break;
+
+	case SDL_EVENT_DROP_BEGIN:
+		g_dropBootedFile = false;
+		break;
+	case SDL_EVENT_DROP_FILE:
+		// Only one file can be booted, so a multi-file drop boots the first.
+		if (event.drop.data && !g_dropBootedFile) {
+			g_dropBootedFile = true;
+			System_PostUIMessage(UIMessage::REQUEST_GAME_BOOT, event.drop.data);
 		}
 		break;
 
@@ -1706,7 +1986,10 @@ void UpdateTextFocus(SDL_Window *window) {
 	if (g_textFocusChanged) {
 		DEBUG_LOG(Log::System, "Updating text focus: %d", g_textFocus);
 		if (g_textFocus) {
-			SDL_StartTextInput(window);
+			if (!SDL_StartTextInput(window) && !g_textInputFallback) {
+				WARN_LOG(Log::System, "SDL_StartTextInput failed (%s), generating text from key events instead. Update SDL, or set SDL_VIDEO_DRIVER=x11, for full text input.", SDL_GetError());
+				g_textInputFallback = true;
+			}
 		} else {
 			SDL_StopTextInput(window);
 		}
@@ -1716,12 +1999,23 @@ void UpdateTextFocus(SDL_Window *window) {
 
 void UpdateSDLCursor() {
 #if !defined(MOBILE_DEVICE)
-	if (lastUIState != GetUIState()) {
-		lastUIState = GetUIState();
-		if (lastUIState == UISTATE_INGAME && g_Config.bFullScreen && !g_Config.bShowTouchControls)
-			SDL_HideCursor();
-		if (lastUIState != UISTATE_INGAME || !g_Config.bFullScreen)
+	lastUIState = GetUIState();
+
+	// In fullscreen while in-game, the cursor auto-hides once the mouse has been still for a
+	// moment, and comes back as soon as it's moved again. Same idea as the Windows version.
+	// While a button is held the user is interacting, so keep it visible.
+	const bool buttonDown = (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK) != 0;
+	const bool autoHide = g_Config.bFullScreen && lastUIState == UISTATE_INGAME && !buttonDown;
+	const bool visible = !autoHide || time_now_d() - g_lastCursorMoveTime < CURSOR_HIDE_DELAY;
+
+	static bool cursorVisible = true;
+	if (visible != cursorVisible) {
+		cursorVisible = visible;
+		if (visible) {
 			SDL_ShowCursor();
+		} else {
+			SDL_HideCursor();
+		}
 	}
 #endif
 }
@@ -1772,6 +2066,17 @@ int main(int argc, char *argv[]) {
 	SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
 #endif
 
+	// SDL's automatic pick between Wayland and X11 doesn't always land on Wayland even in a
+	// Wayland session, and going through XWayland instead costs us scaling and input quality.
+	// So ask for it explicitly when the session looks like Wayland - unless the user has set
+	// SDL_VIDEO_DRIVER, in which case they've already told us what they want.
+	// WAYLAND_DISPLAY is only set on Wayland sessions, so this is a no-op elsewhere.
+	bool preferWayland = false;
+	if (getenv("WAYLAND_DISPLAY") && !getenv("SDL_VIDEO_DRIVER")) {
+		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "wayland");
+		preferWayland = true;
+	}
+
 	bool vulkanMayBeAvailable = false;
 	if (VulkanMayBeAvailable()) {
 		fprintf(stderr, "DEBUG: Vulkan might be available.\n");
@@ -1800,10 +2105,29 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "Failed to initialize SDL with joystick support. Retrying without.\n");
 		joystick_enabled = false;
 		if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
-			fprintf(stderr, "Unable to initialize SDL: %s\n", SDL_GetError());
-			return 1;
+			bool initialized = false;
+			if (preferWayland) {
+				// Asking for Wayland may be exactly what failed, so let SDL pick instead.
+				fprintf(stderr, "Unable to initialize SDL with the Wayland video driver (%s). Letting SDL choose.\n", SDL_GetError());
+				SDL_SetHint(SDL_HINT_VIDEO_DRIVER, nullptr);
+				preferWayland = false;
+				// Retry with joystick support - it was the video driver that failed, not the joysticks.
+				if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
+					joystick_enabled = true;
+					initialized = true;
+				} else {
+					initialized = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+				}
+			}
+			if (!initialized) {
+				fprintf(stderr, "Unable to initialize SDL: %s\n", SDL_GetError());
+				return 1;
+			}
 		}
 	}
+
+	const char *videoDriver = SDL_GetCurrentVideoDriver();
+	fprintf(stderr, "Info: SDL video driver: %s\n", videoDriver ? videoDriver : "(none)");
 
 	fprintf(stderr, "Info: We compiled against SDL version %d.%d.%d", SDL_VERSIONNUM_MAJOR(compiled), SDL_VERSIONNUM_MINOR(compiled), SDL_VERSIONNUM_MICRO(compiled));
 	if (compiled != linked) {
@@ -1947,6 +2271,11 @@ int main(int argc, char *argv[]) {
 	case GPUBackend::OPENGL:
 		fallbackGPUBackend = (int)GPUBackend::VULKAN;
 		break;
+#if PPSSPP_PLATFORM(MAC)
+	case GPUBackend::METAL:
+		fallbackGPUBackend = vulkanMayBeAvailable ? (int)GPUBackend::VULKAN : (int)GPUBackend::OPENGL;
+		break;
+#endif
 	default:
 		fprintf(stderr, "Unknown GPU backend %d, switching to Vulkan.\n", g_Config.iGPUBackend);
 		g_Config.iGPUBackend = (int)GPUBackend::VULKAN;
@@ -1967,6 +2296,26 @@ int main(int argc, char *argv[]) {
 			windowDesc.data2 = (void *)glContext;
 
 			ctx = new SDLGLGraphicsContext();
+#if PPSSPP_PLATFORM(MAC)
+		} else if (backend == GPUBackend::METAL) {
+			window = SDL_CreateWindow("Initializing graphics...", w, h, (SDL_WindowFlags)(mode | SDL_WINDOW_METAL | SDL_WINDOW_HIDDEN));
+			if (!window) {
+				*errorMessage = StringFromFormat("Error creating SDL window: %s", SDL_GetError());
+				return false;
+			}
+			if (x != SDL_WINDOWPOS_UNDEFINED && y != SDL_WINDOWPOS_UNDEFINED) {
+				SDL_SetWindowPosition(window, x, y);
+			}
+			SDL_MetalView metalView = SDL_Metal_CreateView(window);
+			if (!metalView) {
+				*errorMessage = StringFromFormat("Error creating Metal view: %s", SDL_GetError());
+				return false;
+			}
+			windowDesc.winsys = WINDOWSYSTEM_METAL_EXT;
+			windowDesc.data1 = SDL_Metal_GetLayer(metalView);
+			windowDesc.data2 = (void *)window;
+			ctx = new MetalGraphicsContext();
+#endif
 		} else {
 			// Use a local copy of mode: this flag combination is Vulkan-specific, and if we fall back to
 			// OpenGL below, we don't want SDL_WINDOW_VULKAN to stick around and get OR'd in there too.
@@ -2020,7 +2369,7 @@ int main(int argc, char *argv[]) {
 	if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {
 		fprintf(stderr, "Failed to initialize graphics backend: %s\n", error_message.c_str());
 		if (fallbackGPUBackend != -1) {
-			fprintf(stderr, "Attempting to fall back to %s...\n", fallbackGPUBackend == (int)GPUBackend::OPENGL ? "OpenGL" : "Vulkan");
+			fprintf(stderr, "Attempting to fall back to %s...\n", GPUBackendToString((GPUBackend)fallbackGPUBackend).c_str());
 			g_Config.iGPUBackend = fallbackGPUBackend;
 			error_message.clear();
 			if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {
@@ -2050,6 +2399,10 @@ int main(int argc, char *argv[]) {
 	Native_UpdateScreenScale(initialPixelWidth, initialPixelHeight, UIScaleFactorToMultiplier(g_Config.iUIScaleFactor));
 
 	SDL_SetWindowTitle(window, (app_name_nice + " " + PPSSPP_GIT_VERSION).c_str());
+
+	if (cmdLineOptions.gameWindow.value_or(false)) {
+		CreateGameWindow();
+	}
 
 	char iconPath[PATH_MAX];
 #if defined(ASSETS_DIR)
@@ -2131,10 +2484,8 @@ int main(int argc, char *argv[]) {
 		}
 	});
 
+	// Always polled: the status overlay shows it, and so does the HOME screen.
 	auto kick_battery_poll_thread = [&last_battery_poll, &battery_poll_thread_sema] {
-		if (!(g_Config.iShowStatusFlags & (int)ShowStatusFlags::BATTERY_PERCENT)) {
-			return;
-		}
 		double now = time_now_d();
 		if (now - last_battery_poll >= 5.0) {
 			last_battery_poll = now;

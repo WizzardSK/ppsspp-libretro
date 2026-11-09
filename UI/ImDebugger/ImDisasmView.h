@@ -23,7 +23,6 @@ class MIPSState;
 class ImDisasmView {
 public:
 	ImDisasmView();
-	~ImDisasmView();
 
 	// Public variables bounds to imgui checkboxes
 	bool followPC_ = true;
@@ -86,6 +85,9 @@ public:
 	void setShowMode(bool s) {
 		showHex_ = s;
 	}
+	// Removes the function symbol and its name, leaving the code without a function (handy for
+	// testing stack walks without symbols).
+	void RemoveFunction(u32 funcStart);
 	void toggleBreakpoint(bool toggleEnabled = false);
 	void editBreakpoint(ImConfig &cfg);
 
@@ -116,6 +118,15 @@ public:
 		bool retval = mapReloaded_;
 		mapReloaded_ = false;
 		return retval;
+	}
+	// The function start "Select in symbol list" was picked for, if it was since the last call.
+	bool TakeSymbolListRequest(u32 *funcStart) {
+		if (symbolListRequest_ == 0xFFFFFFFF) {
+			return false;
+		}
+		*funcStart = symbolListRequest_;
+		symbolListRequest_ = 0xFFFFFFFF;
+		return true;
 	}
 
 private:
@@ -178,12 +189,18 @@ private:
 	bool searching_ = false;
 	bool keyTaken = false;
 	bool mapReloaded_ = false;
+	u32 symbolListRequest_ = 0xFFFFFFFF;
 
 	int positionLocked_ = 0;
 
 	std::string statusBarText_;
 	u32 funcBegin_ = 0;
 	char funcNameTemp_[128]{};
+
+	// "Scan/remove functions in range" popup.
+	u32 funcRangeAddr_ = 0;
+	u32 funcRangeSize_ = 0;
+	std::string funcRangeError_;
 
 	bool assemblePopup_ = false;
 	u32 assembleAddress_ = 0;
@@ -202,9 +219,6 @@ public:
 	void NotifyStep() {
 		disasmView_.NotifyStep();
 	}
-	void DirtySymbolMap() {
-		symsDirty_ = true;
-	}
 	const char *Title() const {
 		return "CPU Debugger";
 	}
@@ -218,9 +232,11 @@ private:
 
 	u32 gotoAddr_ = 0x08800000;
 
-	// Symbol cache
+	// Symbol cache. Rebuilt whenever the symbol map's version no longer matches the one the
+	// cache was built from - that covers the map being replaced wholesale when a game boots or
+	// exits, not just edits made from here.
 	std::vector<SymbolEntry> symCache_;
-	bool symsDirty_ = true;
+	uint32_t symCacheVersion_ = 0;
 	int selectedSymbol_ = -1;
 	char selectedSymbolName_[128];
 
@@ -229,6 +245,8 @@ private:
 	char symFilter_[64]{};
 	std::vector<int> symMatches_;
 	bool symMatchesDirty_ = true;
+	// Set when the selection was moved from outside the list, so it scrolls there.
+	bool scrollToSelectedSymbol_ = false;
 
 	ImDisasmView disasmView_;
 	char searchTerm_[64]{};

@@ -18,6 +18,7 @@
 #pragma once
 
 #include <functional>
+#include <string>
 #include <thread>
 
 #include "Common/System/Application.h"
@@ -34,7 +35,9 @@ struct WindowDesc;
 // This should be used by platforms that launch a separate thread and doesn't
 // need to run a polling loop in it.
 // NOTE: Does take ownership over Application (which is just a wrapper for NativeInitGraphics/NativeShutdownGraphics/NativeFrame).
-bool MainThreadFunc(GraphicsContext * graphicsContext, Application *application, const WindowDesc &windowDesc, std::function<bool(GraphicsContext *)> frame);
+// On failure (which currently only means the graphics surface couldn't be initialized), errorMessage
+// gets the reason - pass it on to the user, it's the only place it's available.
+bool MainThreadFunc(GraphicsContext * graphicsContext, Application *application, const WindowDesc &windowDesc, std::function<bool(GraphicsContext *)> frame, std::string *errorMessage);
 
 // If you're not using MainThreadFunc, you can at least use these to manage a spinning EmuThread (that calls NativeFrame),
 // whether your graphics context requires multithreading or not. Then use RunMainLoop to implement your main loop for
@@ -47,3 +50,15 @@ void EmuThread_Join(GraphicsContext *graphicsContext, std::thread &emuThread);
 // Call from the main thread.
 // NOTE: Does take ownership over Application (which is just a wrapper for NativeInitGraphics/NativeShutdownGraphics/NativeFrame).
 bool RunMainLoop(GraphicsContext *graphicsContext, Application *application, std::function<bool(GraphicsContext *)> frame);
+
+// Runs whichever thread arrangement graphicsContext asks for, on the calling thread, and doesn't
+// return until the emu thread is done. Either this thread becomes the render thread and the emu
+// thread is spawned alongside it (OpenGL, which needs its API calls on the thread its context is
+// current on), or this thread just runs the main loop because the backend spawns its own render
+// thread (Vulkan, D3D11).
+// The surface has to be initialized already, and is left alone - use MainThreadFunc if you want
+// that taken care of too.
+// shouldExit is optional, but required if you might run this in VR: see the comment on the render
+// loop in EmuThread.cpp for why ThreadFrame() alone isn't enough to get out of there.
+// NOTE: Does take ownership over Application (which is just a wrapper for NativeInitGraphics/NativeShutdownGraphics/NativeFrame).
+void RunGraphicsLoop(GraphicsContext *graphicsContext, Application *application, std::function<bool(GraphicsContext *)> frame, std::function<bool()> shouldExit = nullptr);

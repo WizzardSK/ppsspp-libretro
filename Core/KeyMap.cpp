@@ -185,7 +185,8 @@ void UpdateNativeMenuKeys() {
 		InsertIntoVector(&cancelKeys, hardcodedCancelKeys[i]);
 	}
 	if (!HasMainButtonMapping(cancelKeys)) {
-		confirmKeys.push_back(InputMapping(DEVICE_ID_ANY, confirmWithCross ? NKCODE_BUTTON_A : NKCODE_BUTTON_B));
+		// This used to push the confirm button into confirmKeys - wrong list, wrong button.
+		cancelKeys.push_back(InputMapping(DEVICE_ID_ANY, confirmWithCross ? NKCODE_BUTTON_B : NKCODE_BUTTON_A));
 	}
 
 	const InputMapping hardcodedInfoKeys[] = {
@@ -470,6 +471,7 @@ const KeyMap_IntStrPair psp_button_names[] = {
 	{CTRL_SELECT, "Select"},
 	{CTRL_LTRIGGER, "L"},
 	{CTRL_RTRIGGER, "R"},
+	{CTRL_HOME, "Home"},
 
 	{VIRTKEY_AXIS_Y_MAX, "An.Up"},
 	{VIRTKEY_AXIS_Y_MIN, "An.Down"},
@@ -514,6 +516,7 @@ const KeyMap_IntStrPair psp_button_names[] = {
 	{VIRTKEY_TEXTURE_REPLACE, "Texture Replacement"},
 	{VIRTKEY_SCREENSHOT, "Screenshot"},
 	{VIRTKEY_MUTE_TOGGLE, "Mute toggle"},
+	{VIRTKEY_CREATE_FRAME_DUMP, "Create frame dump"},
 
 #ifdef OPENXR
 	{VIRTKEY_VR_CAMERA_ADJUST, "VR camera adjust"},
@@ -536,7 +539,6 @@ const KeyMap_IntStrPair psp_button_names[] = {
 	{VIRTKEY_AXIS_RIGHT_X_MIN, "RightAn.Left"},
 	{VIRTKEY_AXIS_RIGHT_X_MAX, "RightAn.Right"},
 
-	{CTRL_HOME, "Home"},
 	{CTRL_HOLD, "Hold"},
 	{CTRL_WLAN, "Wlan"},
 	{CTRL_REMOTE_HOLD, "Remote hold"},
@@ -611,6 +613,17 @@ bool InputMappingToPspButton(const InputMapping &mapping, std::vector<int> *pspB
 		}
 	}
 	return found;
+}
+
+void GetAllComboMappingsNoLock(std::vector<MultiInputMapping> *combos) {
+	combos->clear();
+	for (const auto &iter : g_controllerMap) {
+		for (const auto &mapping : iter.second) {
+			if (mapping.mappings.size() > 1) {
+				combos->push_back(mapping);
+			}
+		}
+	}
 }
 
 // This is the main workhorse of the ControlMapper.

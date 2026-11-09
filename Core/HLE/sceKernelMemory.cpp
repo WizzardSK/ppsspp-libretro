@@ -43,6 +43,8 @@
 #include "Core/HLE/KernelWaitHelpers.h"
 
 const int TLSPL_NUM_INDEXES = 16;
+// Wait value of a thread waiting in sceKernelGetTlsAddr. In _sceKernelAllocateTlspl it's the address pointer instead.
+const u32 TLSPL_WAITVALUE_RETURN_ADDR = 1;
 
 //////////////////////////////////////////////////////////////////////////
 // STATE BEGIN
@@ -50,8 +52,6 @@ BlockAllocator userMemory(256);
 BlockAllocator kernelMemory(256);
 BlockAllocator volatileMemory(256);
 
-static int vplWaitTimer = -1;
-static int fplWaitTimer = -1;
 static bool tlsplUsedIndexes[TLSPL_NUM_INDEXES];
 
 // Thread -> TLSPL uids for thread end.
@@ -73,7 +73,8 @@ u32 FPL::GetMissingErrorCode() {
 
 int FPL::FindFreeBlock() {
 	for (int i = 0; i < nf.numBlocks; i++) {
-		int b = nextBlock++ % nf.numBlocks;
+		int b = nextBlock % nf.numBlocks;
+		nextBlock = b + 1;
 		if (!blocks[b]) {
 			return b;
 		}
@@ -102,8 +103,14 @@ void FPL::DoState(PointerWrap &p) {
 		return;
 
 	Do(p, nf);
-	if (p.mode == p.MODE_READ)
+	TerminateLoadedCString(p, nf.name);
+	if (p.mode == p.MODE_READ) {
+		if (nf.numBlocks < 0 || !p.CheckRead(nf.numBlocks)) {
+			p.SetError(p.ERROR_FAILURE);
+			return;
+		}
 		blocks = new bool[nf.numBlocks];
+	}
 	DoArray(p, blocks, nf.numBlocks);
 	Do(p, address);
 	Do(p, alignedSize);
@@ -111,6 +118,11 @@ void FPL::DoState(PointerWrap &p) {
 	FplWaitingThread dv = { 0 };
 	Do(p, waitingThreads, dv);
 	Do(p, pausedWaits);
+	// It's taken modulo the block count, but a negative one stays negative. Older versions let it
+	// overflow, so just restart the search.
+	if (p.mode == p.MODE_READ && nextBlock < 0) {
+		nextBlock = 0;
+	}
 }
 
 void SceKernelVplHeader::Init(u32 ptr, u32 size) {
@@ -288,6 +300,7 @@ void VPL::DoState(PointerWrap &p) {
 	}
 
 	Do(p, nv);
+	TerminateLoadedCString(p, nv.name);
 	Do(p, address);
 	VplWaitingThread dv = { 0 };
 	Do(p, waitingThreads, dv);
@@ -301,6 +314,7 @@ void VPL::DoState(PointerWrap &p) {
 
 void __KernelVplTimeout(u64 userdata, int cyclesLate);
 void __KernelFplTimeout(u64 userdata, int cyclesLate);
+void __KernelTlsplTimeout(u64 userdata, int cyclesLate);
 void __KernelTlsplThreadEnd(SceUID threadID);
 
 void __KernelVplBeginCallback(SceUID threadID, SceUID prevCallbackId);
@@ -312,7 +326,7 @@ void __KernelMemoryInit()
 {
 	MemBlockInfoInit();
 	kernelMemory.Init(PSP_GetKernelMemoryBase(), PSP_GetKernelMemoryEnd() - PSP_GetKernelMemoryBase(), false);
-	userMemory.Init(PSP_GetUserMemoryBase(), PSP_GetUserMemoryEnd() - PSP_GetUserMemoryBase(), false);
+	userMemory.Init(PSP_GetUserMemoryBase(), PSP_GetUserPartitionEnd() - PSP_GetUserMemoryBase(), false);
 	volatileMemory.Init(PSP_GetVolatileMemoryStart(), PSP_GetVolatileMemoryEnd() - PSP_GetVolatileMemoryStart(), false);
 
 	Memory::Memset(PSP_GetKernelMemoryBase(), 0, PSP_GetKernelMemoryEnd() - PSP_GetKernelMemoryBase());
@@ -323,8 +337,6 @@ void __KernelMemoryInit()
 
 	INFO_LOG(Log::sceKernel, "Kernel and user memory pools initialized");
 
-	vplWaitTimer = CoreTiming::RegisterEvent("VplTimeout", __KernelVplTimeout);
-	fplWaitTimer = CoreTiming::RegisterEvent("FplTimeout", __KernelFplTimeout);
 
 	flags_ = 0;
 	sdkVersion_ = 0;
@@ -333,8 +345,9 @@ void __KernelMemoryInit()
 
 	__KernelListenThreadEnd(&__KernelTlsplThreadEnd);
 
-	__KernelRegisterWaitTypeFuncs(WAITTYPE_VPL, __KernelVplBeginCallback, __KernelVplEndCallback);
-	__KernelRegisterWaitTypeFuncs(WAITTYPE_FPL, __KernelFplBeginCallback, __KernelFplEndCallback);
+	__KernelRegisterWaitTypeFuncs(WAITTYPE_VPL, __KernelVplBeginCallback, __KernelVplEndCallback, __KernelVplTimeout);
+	__KernelRegisterWaitTypeFuncs(WAITTYPE_FPL, __KernelFplBeginCallback, __KernelFplEndCallback, __KernelFplTimeout);
+	__KernelRegisterWaitTypeFuncs(WAITTYPE_TLSPL, nullptr, nullptr, __KernelTlsplTimeout);
 
 	// The kernel statically allocates this memory, which has some code in it.
 	// It appears this is used for some common funcs in Kernel_Library (memcpy, lwmutex, suspend intr, etc.)
@@ -344,7 +357,7 @@ void __KernelMemoryInit()
 
 void __KernelMemoryDoState(PointerWrap &p)
 {
-	auto s = p.Section("sceKernelMemory", 1, 3);
+	auto s = p.Section("sceKernelMemory", 1, 5);
 	if (!s)
 		return;
 
@@ -353,16 +366,24 @@ void __KernelMemoryDoState(PointerWrap &p)
 	if (s >= 3)
 		volatileMemory.DoState(p);
 
-	Do(p, vplWaitTimer);
-	CoreTiming::RestoreRegisterEvent(vplWaitTimer, "VplTimeout", __KernelVplTimeout);
-	Do(p, fplWaitTimer);
-	CoreTiming::RestoreRegisterEvent(fplWaitTimer, "FplTimeout", __KernelFplTimeout);
+	if (s < 5) {
+		int oldTimeoutEvent = -1;
+		Do(p, oldTimeoutEvent);
+		__KernelRestoreOldWaitTimeoutEvent(oldTimeoutEvent, "VplTimeout");
+		Do(p, oldTimeoutEvent);
+		__KernelRestoreOldWaitTimeoutEvent(oldTimeoutEvent, "FplTimeout");
+	}
 	Do(p, flags_);
 	Do(p, sdkVersion_);
 	Do(p, compilerVersion_);
 	DoArray(p, tlsplUsedIndexes, ARRAY_SIZE(tlsplUsedIndexes));
 	if (s >= 2) {
 		Do(p, tlsplThreadEndChecks);
+	}
+	if (s == 4) {
+		int oldTimeoutEvent = -1;
+		Do(p, oldTimeoutEvent);
+		__KernelRestoreOldWaitTimeoutEvent(oldTimeoutEvent, "TlsplTimeout");
 	}
 
 	MemBlockInfoDoState(p);
@@ -390,11 +411,17 @@ void __KernelMemoryShutdown()
 }
 
 BlockAllocator *BlockAllocatorFromID(int id) {
+	// A kernel module gets the privileged partitions whichever entry point it came in through -
+	// threads/tls/kernel/partition records sceKernelCreateTlspl accepting 1, 3 and 4 from a
+	// kernel module and refusing them from user mode, and it reaches the kernel through the
+	// ordinary ThreadManForUser NID either way. hleIsKernelMode() alone only catches the case
+	// where the export itself is kernel-only.
+	const bool kernelMode = hleIsKernelMode() || __KernelCurThreadIsKernelMode();
 	switch (id) {
 	case KERNEL_PARTITION_ID:
 	case 3:
 	case 4:
-		if (hleIsKernelMode())
+		if (kernelMode)
 			return &kernelMemory;
 		return nullptr;
 
@@ -404,7 +431,7 @@ BlockAllocator *BlockAllocatorFromID(int id) {
 
 	case 8:
 	case 10:
-		if (hleIsKernelMode())
+		if (kernelMode)
 			return &userMemory;
 		return nullptr;
 
@@ -465,11 +492,7 @@ static bool __KernelUnlockFplForThread(FPL *fpl, FplWaitingThread &threadInfo, u
 	}
 
 	u32 timeoutPtr = __KernelGetWaitTimeoutPtr(threadID, error);
-	if (timeoutPtr != 0 && fplWaitTimer != -1) {
-		// Remove any event for this thread.
-		s64 cyclesLeft = CoreTiming::UnscheduleEvent(fplWaitTimer, threadID);
-		Memory::WriteOrException_U32((u32) cyclesToUs(cyclesLeft), timeoutPtr);
-	}
+	HLEKernel::WriteRemainingTimeout(threadID, timeoutPtr);
 
 	__KernelResumeThreadFromWait(threadID, result);
 	wokeThreads = true;
@@ -478,7 +501,7 @@ static bool __KernelUnlockFplForThread(FPL *fpl, FplWaitingThread &threadInfo, u
 
 void __KernelFplBeginCallback(SceUID threadID, SceUID prevCallbackId)
 {
-	auto result = HLEKernel::WaitBeginCallback<FPL, WAITTYPE_FPL, FplWaitingThread>(threadID, prevCallbackId, fplWaitTimer);
+	auto result = HLEKernel::WaitBeginCallback<FPL, WAITTYPE_FPL, FplWaitingThread>(threadID, prevCallbackId);
 	if (result == HLEKernel::WAIT_CB_SUCCESS)
 		DEBUG_LOG(Log::sceKernel, "sceKernelAllocateFplCB: Suspending fpl wait for callback");
 	else if (result == HLEKernel::WAIT_CB_BAD_WAIT_DATA)
@@ -489,25 +512,9 @@ void __KernelFplBeginCallback(SceUID threadID, SceUID prevCallbackId)
 
 void __KernelFplEndCallback(SceUID threadID, SceUID prevCallbackId)
 {
-	auto result = HLEKernel::WaitEndCallback<FPL, WAITTYPE_FPL, FplWaitingThread>(threadID, prevCallbackId, fplWaitTimer, __KernelUnlockFplForThread);
+	auto result = HLEKernel::WaitEndCallback<FPL, WAITTYPE_FPL, FplWaitingThread>(threadID, prevCallbackId, __KernelUnlockFplForThread);
 	if (result == HLEKernel::WAIT_CB_RESUMED_WAIT)
 		DEBUG_LOG(Log::sceKernel, "sceKernelAllocateFplCB: Resuming mbx wait from callback");
-}
-
-static bool __FplThreadSortPriority(FplWaitingThread thread1, FplWaitingThread thread2)
-{
-	return __KernelThreadSortPriority(thread1.threadID, thread2.threadID);
-}
-
-static bool __KernelClearFplThreads(FPL *fpl, int reason)
-{
-	u32 error;
-	bool wokeThreads = false;
-	for (auto iter = fpl->waitingThreads.begin(), end = fpl->waitingThreads.end(); iter != end; ++iter)
-		__KernelUnlockFplForThread(fpl, *iter, error, reason, wokeThreads);
-	fpl->waitingThreads.clear();
-
-	return wokeThreads;
 }
 
 static void __KernelSortFplThreads(FPL *fpl)
@@ -517,13 +524,16 @@ static void __KernelSortFplThreads(FPL *fpl)
 	HLEKernel::CleanupWaitingThreads(WAITTYPE_FPL, uid, fpl->waitingThreads);
 
 	if ((fpl->nf.attr & PSP_FPL_ATTR_PRIORITY) != 0)
-		std::stable_sort(fpl->waitingThreads.begin(), fpl->waitingThreads.end(), __FplThreadSortPriority);
+		HLEKernel::SortWaitingThreadsByPriority(fpl->waitingThreads);
 }
 
 int sceKernelCreateFpl(const char *name, u32 mpid, u32 attr, u32 blockSize, u32 numBlocks, u32 optPtr) {
 	if (!name)
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_NO_MEMORY, "invalid name");
-	if (mpid < 1 || mpid > 9 || mpid == 7)
+	// Only partitions 1-6 exist. sysmem/partitions and its kernel-mode twin record 7 and up
+	// coming back ILLEGAL_ARGUMENT from both privilege levels; what privilege changes is the
+	// permission check below, not the range.
+	if (mpid < 1 || mpid > 6)
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, "invalid partition %d", mpid);
 
 	BlockAllocator *allocator = BlockAllocatorFromID(mpid);
@@ -556,6 +566,12 @@ int sceKernelCreateFpl(const char *name, u32 mpid, u32 attr, u32 blockSize, u32 
 		alignment = 4;
 
 	int alignedSize = ((int)blockSize + alignment - 1) & ~(alignment - 1);
+	// The size check above uses 4 byte alignment, but the caller can ask for much more than that,
+	// so the aligned total can still overflow - and then we'd allocate a small block while
+	// numBlocks stays huge, handing out block addresses outside it.
+	if ((u64)(u32)alignedSize * (u64)numBlocks > 0xFFFFFFFFULL)
+		return hleReportWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE, "aligned blockSize/count overflows");
+
 	u32 totalSize = alignedSize * numBlocks;
 	bool atEnd = (attr & PSP_FPL_ATTR_HIGHMEM) != 0;
 	u32 address = allocator->Alloc(totalSize, atEnd, StringFromFormat("FPL/%s", name).c_str());
@@ -592,7 +608,7 @@ int sceKernelDeleteFpl(SceUID uid)
 		return hleLogDebug(Log::sceKernel, error, "invalid fpl");
 	}
 
-	bool wokeThreads = __KernelClearFplThreads(fpl, SCE_KERNEL_ERROR_WAIT_DELETE);
+	bool wokeThreads = HLEKernel::ClearWaitingThreads(fpl, SCE_KERNEL_ERROR_WAIT_DELETE, __KernelUnlockFplForThread);
 	if (wokeThreads)
 		hleReSchedule("fpl deleted");
 
@@ -607,26 +623,6 @@ void __KernelFplTimeout(u64 userdata, int cyclesLate)
 {
 	SceUID threadID = (SceUID) userdata;
 	HLEKernel::WaitExecTimeout<FPL, WAITTYPE_FPL>(threadID);
-}
-
-static void __KernelSetFplTimeout(u32 timeoutPtr)
-{
-	if (timeoutPtr == 0 || fplWaitTimer == -1)
-		return;
-
-	int micro = (int) Memory::ReadOrException_U32(timeoutPtr);
-
-	// TODO: test for fpls.
-	// This happens to be how the hardware seems to time things.
-	if (micro <= 5)
-		micro = 20;
-	// Yes, this 7 is reproducible.  6 is (a lot) longer than 7.
-	else if (micro == 7)
-		micro = 25;
-	else if (micro <= 215)
-		micro = 250;
-
-	CoreTiming::ScheduleEvent(usToCycles(micro), fplWaitTimer, __KernelGetCurThread());
 }
 
 int sceKernelAllocateFpl(SceUID uid, u32 blockPtrAddr, u32 timeoutPtr) {
@@ -644,11 +640,12 @@ int sceKernelAllocateFpl(SceUID uid, u32 blockPtrAddr, u32 timeoutPtr) {
 	} else {
 		SceUID threadID = __KernelGetCurThread();
 		HLEKernel::RemoveWaitingThread(fpl->waitingThreads, threadID);
+		if (__KernelWaitTimesOutAtOnce(timeoutPtr))
+			return hleLogDebug(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT, "timed out at once");
 		FplWaitingThread waiting = {threadID, blockPtrAddr};
 		fpl->waitingThreads.push_back(waiting);
 
-		__KernelSetFplTimeout(timeoutPtr);
-		__KernelWaitCurThread(WAITTYPE_FPL, uid, 0, timeoutPtr, false, "fpl waited");
+		__KernelWaitCurThreadWithTimeout(WAITTYPE_FPL, uid, 0, timeoutPtr, false, "fpl waited");
 	}
 
 	return hleLogDebug(Log::sceKernel, 0);
@@ -669,11 +666,12 @@ int sceKernelAllocateFplCB(SceUID uid, u32 blockPtrAddr, u32 timeoutPtr) {
 	} else {
 		SceUID threadID = __KernelGetCurThread();
 		HLEKernel::RemoveWaitingThread(fpl->waitingThreads, threadID);
+		if (__KernelWaitTimesOutAtOnce(timeoutPtr))
+			return hleLogDebug(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT, "timed out at once");
 		FplWaitingThread waiting = {threadID, blockPtrAddr};
 		fpl->waitingThreads.push_back(waiting);
 
-		__KernelSetFplTimeout(timeoutPtr);
-		__KernelWaitCurThread(WAITTYPE_FPL, uid, 0, timeoutPtr, true, "fpl waited");
+		__KernelWaitCurThreadWithTimeout(WAITTYPE_FPL, uid, 0, timeoutPtr, true, "fpl waited");
 	}
 
 	return hleLogDebug(Log::sceKernel, 0);
@@ -752,7 +750,7 @@ int sceKernelCancelFpl(SceUID uid, u32 numWaitThreadsPtr) {
 	if (Memory::IsValid4AlignedAddress(numWaitThreadsPtr)) {
 		Memory::WriteUnchecked_U32(fpl->nf.numWaitThreads, numWaitThreadsPtr);
 	}
-	bool wokeThreads = __KernelClearFplThreads(fpl, SCE_KERNEL_ERROR_WAIT_CANCEL);
+	bool wokeThreads = HLEKernel::ClearWaitingThreads(fpl, SCE_KERNEL_ERROR_WAIT_CANCEL, __KernelUnlockFplForThread);
 	if (wokeThreads)
 		hleReSchedule("fpl canceled");
 	return hleLogDebug(Log::sceKernel, 0);
@@ -838,16 +836,25 @@ public:
 			return;
 
 		Do(p, address);
-		DoArray(p, name, sizeof(name));
+		DoCString(p, name);
 		if (s >= 2) {
 			int allocType = BlockAllocatorToID(alloc);
 			Do(p, allocType);
-			alloc = BlockAllocatorFromID(allocType);
+			// From BlockAllocatorToID, so not a game's partition id: map it back without
+			// BlockAllocatorFromID's privilege check, which asks about whatever thread is current.
+			switch (allocType) {
+			case KERNEL_PARTITION_ID: alloc = &kernelMemory; break;
+			case USER_PARTITION_ID: alloc = &userMemory; break;
+			case VSHELL_PARTITION_ID: alloc = &volatileMemory; break;
+			default: alloc = nullptr; break;
+			}
 		}
 	}
 
 	BlockAllocator *alloc;
-	u32 address;
+	// Note: the savestate constructor doesn't allocate, and DoState bails out if the section is
+	// missing - so this needs a value the destructor won't try to free.
+	u32 address = (u32)-1;
 	char name[32];
 };
 
@@ -872,8 +879,14 @@ int sceKernelAllocPartitionMemory(int partition, const char *name, int type, u32
 		if ((addr & (addr - 1)) != 0 || addr == 0)
 			return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ALIGNMENT_SIZE, "invalid alignment %x", addr);
 	}
-	if (partition < 1 || partition > 9 || partition == 7)
-		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, "invalid partition %x", partition);
+	// SysMemUserForUser and SysMemForKernel both land here, and sysmem/partitions shows they
+	// report an out-of-range partition differently - ILLEGAL_ARGUMENT from the user entry point,
+	// ILLEGAL_PARTITION from the kernel one. hleIsKernelMode() is exactly "came in through the
+	// kernel NID", which is the distinction being made.
+	if (partition < 1 || partition > 6) {
+		const u32 error = hleIsKernelMode() ? SCE_KERNEL_ERROR_ILLEGAL_PARTITION : SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+		return hleLogWarning(Log::sceKernel, error, "invalid partition %x", partition);
+	}
 
 	BlockAllocator *allocator = BlockAllocatorFromID(partition);
 	if (allocator == nullptr)
@@ -910,7 +923,7 @@ u32 sceKernelGetBlockHeadAddr(SceUID id) {
 	}
 }
 
-static int sceKernelPrintf(const char *formatString) {
+static int sceKernelPrintf(MIPSState *mips, const char *formatString) {
 	if (!formatString)
 		return -1;
 
@@ -1247,11 +1260,7 @@ static bool __KernelUnlockVplForThread(VPL *vpl, VplWaitingThread &threadInfo, u
 	}
 
 	u32 timeoutPtr = __KernelGetWaitTimeoutPtr(threadID, error);
-	if (timeoutPtr != 0 && vplWaitTimer != -1) {
-		// Remove any event for this thread.
-		s64 cyclesLeft = CoreTiming::UnscheduleEvent(vplWaitTimer, threadID);
-		Memory::WriteOrException_U32((u32) cyclesToUs(cyclesLeft), timeoutPtr);
-	}
+	HLEKernel::WriteRemainingTimeout(threadID, timeoutPtr);
 
 	__KernelResumeThreadFromWait(threadID, result);
 	wokeThreads = true;
@@ -1260,7 +1269,7 @@ static bool __KernelUnlockVplForThread(VPL *vpl, VplWaitingThread &threadInfo, u
 
 void __KernelVplBeginCallback(SceUID threadID, SceUID prevCallbackId)
 {
-	auto result = HLEKernel::WaitBeginCallback<VPL, WAITTYPE_VPL, VplWaitingThread>(threadID, prevCallbackId, vplWaitTimer);
+	auto result = HLEKernel::WaitBeginCallback<VPL, WAITTYPE_VPL, VplWaitingThread>(threadID, prevCallbackId);
 	if (result == HLEKernel::WAIT_CB_SUCCESS)
 		DEBUG_LOG(Log::sceKernel, "sceKernelAllocateVplCB: Suspending vpl wait for callback");
 	else if (result == HLEKernel::WAIT_CB_BAD_WAIT_DATA)
@@ -1271,25 +1280,9 @@ void __KernelVplBeginCallback(SceUID threadID, SceUID prevCallbackId)
 
 void __KernelVplEndCallback(SceUID threadID, SceUID prevCallbackId)
 {
-	auto result = HLEKernel::WaitEndCallback<VPL, WAITTYPE_VPL, VplWaitingThread>(threadID, prevCallbackId, vplWaitTimer, __KernelUnlockVplForThread);
+	auto result = HLEKernel::WaitEndCallback<VPL, WAITTYPE_VPL, VplWaitingThread>(threadID, prevCallbackId, __KernelUnlockVplForThread);
 	if (result == HLEKernel::WAIT_CB_RESUMED_WAIT)
 		DEBUG_LOG(Log::sceKernel, "sceKernelAllocateVplCB: Resuming mbx wait from callback");
-}
-
-static bool __VplThreadSortPriority(VplWaitingThread thread1, VplWaitingThread thread2)
-{
-	return __KernelThreadSortPriority(thread1.threadID, thread2.threadID);
-}
-
-static bool __KernelClearVplThreads(VPL *vpl, int reason)
-{
-	u32 error;
-	bool wokeThreads = false;
-	for (auto iter = vpl->waitingThreads.begin(), end = vpl->waitingThreads.end(); iter != end; ++iter)
-		__KernelUnlockVplForThread(vpl, *iter, error, reason, wokeThreads);
-	vpl->waitingThreads.clear();
-
-	return wokeThreads;
 }
 
 static void __KernelSortVplThreads(VPL *vpl)
@@ -1299,13 +1292,16 @@ static void __KernelSortVplThreads(VPL *vpl)
 	HLEKernel::CleanupWaitingThreads(WAITTYPE_VPL, uid, vpl->waitingThreads);
 
 	if ((vpl->nv.attr & PSP_VPL_ATTR_PRIORITY) != 0)
-		std::stable_sort(vpl->waitingThreads.begin(), vpl->waitingThreads.end(), __VplThreadSortPriority);
+		HLEKernel::SortWaitingThreadsByPriority(vpl->waitingThreads);
 }
 
 SceUID sceKernelCreateVpl(const char *name, int partition, u32 attr, u32 vplSize, u32 optPtr) {
 	if (!name)
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ERROR, "invalid name");
-	if (partition < 1 || partition > 9 || partition == 7)
+	// Only partitions 1-6 exist. sysmem/partitions and its kernel-mode twin record 7 and up
+	// coming back ILLEGAL_ARGUMENT from both privilege levels; what privilege changes is the
+	// permission check below, not the range.
+	if (partition < 1 || partition > 6)
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, "invalid partition %d", partition);
 
 	BlockAllocator *allocator = BlockAllocatorFromID(partition);
@@ -1370,7 +1366,7 @@ int sceKernelDeleteVpl(SceUID uid) {
 		return hleLogError(Log::sceKernel, error);
 	} else {
 		DEBUG_LOG(Log::sceKernel, "sceKernelDeleteVpl(%i)", uid);
-		bool wokeThreads = __KernelClearVplThreads(vpl, SCE_KERNEL_ERROR_WAIT_DELETE);
+		bool wokeThreads = HLEKernel::ClearWaitingThreads(vpl, SCE_KERNEL_ERROR_WAIT_DELETE, __KernelUnlockVplForThread);
 		if (wokeThreads)
 			hleReSchedule("vpl deleted");
 
@@ -1443,7 +1439,7 @@ void __KernelVplTimeout(u64 userdata, int cyclesLate) {
 	// If in FIFO mode, that may have cleared another thread to wake up.
 	VPL *vpl = kernelObjects.Get<VPL>(uid, error);
 	if (vpl && (vpl->nv.attr & PSP_VPL_ATTR_MASK_ORDER) == PSP_VPL_ATTR_FIFO) {
-		bool wokeThreads;
+		bool wokeThreads = false;
 		std::vector<VplWaitingThread>::iterator iter = vpl->waitingThreads.begin();
 		// Unlock every waiting thread until the first that must still wait.
 		while (iter != vpl->waitingThreads.end() && __KernelUnlockVplForThread(vpl, *iter, error, 0, wokeThreads)) {
@@ -1451,25 +1447,6 @@ void __KernelVplTimeout(u64 userdata, int cyclesLate) {
 			iter = vpl->waitingThreads.begin();
 		}
 	}
-}
-
-static void __KernelSetVplTimeout(u32 timeoutPtr)
-{
-	if (timeoutPtr == 0 || vplWaitTimer == -1)
-		return;
-
-	int micro = (int) Memory::ReadOrException_U32(timeoutPtr);
-
-	// This happens to be how the hardware seems to time things.
-	if (micro <= 5)
-		micro = 20;
-	// Yes, this 7 is reproducible.  6 is (a lot) longer than 7.
-	else if (micro == 7)
-		micro = 25;
-	else if (micro <= 215)
-		micro = 250;
-
-	CoreTiming::ScheduleEvent(usToCycles(micro), vplWaitTimer, __KernelGetCurThread());
 }
 
 int sceKernelAllocateVpl(SceUID uid, u32 size, u32 addrPtr, u32 timeoutPtr)
@@ -1480,8 +1457,9 @@ int sceKernelAllocateVpl(SceUID uid, u32 size, u32 addrPtr, u32 timeoutPtr)
 		VPL *vpl = kernelObjects.Get<VPL>(uid, ignore);
 		if (error == SCE_KERNEL_ERROR_NO_MEMORY)
 		{
-			if (timeoutPtr != 0 && Memory::ReadOrException_U32(timeoutPtr) == 0)
-				return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+			// Allocating does more before setting up the timeout, so short ones time out at once more often.
+			if (__KernelWaitTimesOutAtOnce(timeoutPtr, 117, 17))
+				return hleLogDebug(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT, "timed out at once");
 
 			if (vpl) {
 				SceUID threadID = __KernelGetCurThread();
@@ -1490,8 +1468,7 @@ int sceKernelAllocateVpl(SceUID uid, u32 size, u32 addrPtr, u32 timeoutPtr)
 				vpl->waitingThreads.push_back(waiting);
 			}
 
-			__KernelSetVplTimeout(timeoutPtr);
-			__KernelWaitCurThread(WAITTYPE_VPL, uid, size, timeoutPtr, false, "vpl waited");
+			__KernelWaitCurThreadWithTimeout(WAITTYPE_VPL, uid, size, timeoutPtr, false, "vpl waited");
 		}
 		// If anyone else was waiting, the allocation causes a delay.
 		else if (error == 0 && !vpl->waitingThreads.empty())
@@ -1510,8 +1487,9 @@ int sceKernelAllocateVplCB(SceUID uid, u32 size, u32 addrPtr, u32 timeoutPtr)
 		VPL *vpl = kernelObjects.Get<VPL>(uid, ignore);
 		if (error == SCE_KERNEL_ERROR_NO_MEMORY)
 		{
-			if (timeoutPtr != 0 && Memory::ReadOrException_U32(timeoutPtr) == 0)
-				return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+			// Allocating does more before setting up the timeout, so short ones time out at once more often.
+			if (__KernelWaitTimesOutAtOnce(timeoutPtr, 117, 17))
+				return hleLogDebug(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT, "timed out at once");
 
 			if (vpl)
 			{
@@ -1521,8 +1499,7 @@ int sceKernelAllocateVplCB(SceUID uid, u32 size, u32 addrPtr, u32 timeoutPtr)
 				vpl->waitingThreads.push_back(waiting);
 			}
 
-			__KernelSetVplTimeout(timeoutPtr);
-			__KernelWaitCurThread(WAITTYPE_VPL, uid, size, timeoutPtr, true, "vpl waited");
+			__KernelWaitCurThreadWithTimeout(WAITTYPE_VPL, uid, size, timeoutPtr, true, "vpl waited");
 		}
 		// If anyone else was waiting, the allocation causes a delay.
 		else if (error == 0 && !vpl->waitingThreads.empty())
@@ -1594,7 +1571,7 @@ int sceKernelCancelVpl(SceUID uid, u32 numWaitThreadsPtr)
 		if (Memory::IsValid4AlignedAddress(numWaitThreadsPtr))
 			Memory::WriteUnchecked_U32(vpl->nv.numWaitThreads, numWaitThreadsPtr);
 
-		bool wokeThreads = __KernelClearVplThreads(vpl, SCE_KERNEL_ERROR_WAIT_CANCEL);
+		bool wokeThreads = HLEKernel::ClearWaitingThreads(vpl, SCE_KERNEL_ERROR_WAIT_CANCEL, __KernelUnlockVplForThread);
 		if (wokeThreads)
 			hleReSchedule("vpl canceled");
 
@@ -1678,7 +1655,8 @@ static u32 SysMemUserForUser_D8DE5C1E() {
 // Real name per uofw's src/kd/sysmem/exports.exp: sceKernelTotalMemSize - the total size (not
 // free size, see sceKernelMaxFreeMemSize above) of the user memory partition.
 static u32 sceKernelTotalMemSize() {
-	return hleLogDebug(Log::sceKernel, PSP_GetUserMemoryEnd() - PSP_GetUserMemoryBase());
+	// The partition's own range, which survives savestates (see PSP_GetUserPartitionEnd).
+	return hleLogDebug(Log::sceKernel, userMemory.GetRangeSize());
 }
 
 static u32 SysMemUserForUser_945E45DA() {
@@ -1725,6 +1703,7 @@ struct TLSPL : public KernelObject {
 			return;
 
 		Do(p, ntls);
+		TerminateLoadedCString(p, ntls.name);
 		Do(p, address);
 		if (s >= 2)
 			Do(p, alignment);
@@ -1733,6 +1712,11 @@ struct TLSPL : public KernelObject {
 		Do(p, waitingThreads);
 		Do(p, next);
 		Do(p, usage);
+		// Both index arrays.
+		if (p.mode == p.MODE_READ && (ntls.index < 0 || ntls.index >= TLSPL_NUM_INDEXES || usage.size() != (size_t)ntls.totalBlocks)) {
+			ERROR_LOG(Log::SaveState, "TLSPL: bad index %d or block count %d (%d used) in savestate", ntls.index, ntls.totalBlocks, (int)usage.size());
+			p.SetError(p.ERROR_FAILURE);
+		}
 	}
 
 	NativeTlspl ntls;
@@ -1755,7 +1739,7 @@ static void __KernelSortTlsplThreads(TLSPL *tls)
 	HLEKernel::CleanupWaitingThreads(WAITTYPE_TLSPL, uid, tls->waitingThreads);
 
 	if ((tls->ntls.attr & PSP_FPL_ATTR_PRIORITY) != 0)
-		std::stable_sort(tls->waitingThreads.begin(), tls->waitingThreads.end(), __KernelThreadSortPriority);
+		HLEKernel::SortWaitingThreadsByPriority(tls->waitingThreads);
 }
 
 int __KernelFreeTls(TLSPL *tls, SceUID threadID)
@@ -1805,7 +1789,17 @@ int __KernelFreeTls(TLSPL *tls, SceUID threadID)
 
 			// Otherwise, if there was a thread waiting, we were full, so this newly freed one is theirs.
 			tls->usage[freeBlock] = waitingThreadID;
-			__KernelResumeThreadFromWait(waitingThreadID, freedAddress);
+			// _sceKernelAllocateTlspl waits with its address pointer as the wait value, sceKernelGetTlsAddr with 1.
+			u32 error;
+			u32 timeoutPtr = __KernelGetWaitTimeoutPtr(waitingThreadID, error);
+			HLEKernel::WriteRemainingTimeout(waitingThreadID, timeoutPtr);
+			u32 addrPtr = __KernelGetWaitValue(waitingThreadID, error);
+			if (addrPtr != TLSPL_WAITVALUE_RETURN_ADDR) {
+				Memory::WriteOrException_U32(freedAddress, addrPtr);
+				__KernelResumeThreadFromWait(waitingThreadID, 0);
+			} else {
+				__KernelResumeThreadFromWait(waitingThreadID, freedAddress);
+			}
 
 			// Gotta watch the thread to quit as well, since they've allocated now.
 			tlsplThreadEndChecks.emplace(waitingThreadID, uid);
@@ -1837,25 +1831,20 @@ void __KernelTlsplThreadEnd(SceUID threadID)
 			tls->waitingThreads.erase(std::remove(tls->waitingThreads.begin(), tls->waitingThreads.end(), threadID), tls->waitingThreads.end());
 	}
 
-	// Unlock all pools the thread had locked.
+	// Unlock all pools the thread had locked. Freeing mutates the map, so collect them first.
+	std::vector<SceUID> lockedIDs;
 	auto locked = tlsplThreadEndChecks.equal_range(threadID);
-	for (TlsplMap::iterator iter = locked.first; iter != locked.second; ++iter)
-	{
-		SceUID tlsID = iter->second;
-		TLSPL *tls = kernelObjects.Get<TLSPL>(tlsID, error);
-
-		if (tls)
-		{
-			__KernelFreeTls(tls, threadID);
-
-			// Restart the loop, freeing mutated it.
-			locked = tlsplThreadEndChecks.equal_range(threadID);
-			iter = locked.first;
-			if (locked.first == locked.second)
-				break;
-		}
+	for (TlsplMap::iterator iter = locked.first; iter != locked.second; ++iter) {
+		lockedIDs.push_back(iter->second);
 	}
 	tlsplThreadEndChecks.erase(locked.first, locked.second);
+
+	for (SceUID tlsID : lockedIDs) {
+		TLSPL *tls = kernelObjects.Get<TLSPL>(tlsID, error);
+		if (tls) {
+			__KernelFreeTls(tls, threadID);
+		}
+	}
 }
 
 SceUID sceKernelCreateTlspl(const char *name, u32 partition, u32 attr, u32 blockSize, u32 count, u32 optionsPtr) {
@@ -1863,7 +1852,12 @@ SceUID sceKernelCreateTlspl(const char *name, u32 partition, u32 attr, u32 block
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_NO_MEMORY, "invalid name");
 	if ((attr & ~PSP_TLSPL_ATTR_KNOWN) >= 0x100)
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ATTR, "invalid attr parameter: %08x", attr);
-	if (partition < 1 || partition > 9 || partition == 7)
+	// Only 1-6 exist, in either privilege level: threads/tls/partition and its kernel-mode twin
+	// both record 7 and up returning ILLEGAL_ARGUMENT on a real PSP. What the privilege changes
+	// is the permission check below - 1, 3 and 4 are ILLEGAL_PERM from user mode and fine from
+	// kernel mode. Note this differs from sceKernelCreateVpl above, which lets 8 and 9 reach the
+	// permission check; the two used to share a range that was only ever right for Vpl.
+	if (partition < 1 || partition > 6)
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, "invalid partition %d", partition);
 
 	BlockAllocator *allocator = BlockAllocatorFromID(partition);
@@ -1908,6 +1902,11 @@ SceUID sceKernelCreateTlspl(const char *name, u32 partition, u32 attr, u32 block
 
 	// Upalign.  Strangely, the sceKernelReferTlsplStatus value is the original.
 	u32 alignedSize = (blockSize + alignment - 1) & ~(alignment - 1);
+	// The size check above uses 4 byte alignment, but the caller can ask for much more than that,
+	// so the aligned total can still overflow - and then we'd allocate a small block while
+	// totalBlocks stays huge, handing out block addresses outside it.
+	if ((u64)alignedSize * (u64)count > 0xFFFFFFFFULL)
+		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE, "aligned blockSize/count overflows");
 
 	u32 totalSize = alignedSize * count;
 	u32 blockPtr = allocator->Alloc(totalSize, (attr & PSP_TLSPL_ATTR_HIGHMEM) != 0, StringFromFormat("TLS/%s", name).c_str());
@@ -1959,8 +1958,14 @@ int sceKernelDeleteTlspl(SceUID uid)
 
 		WARN_LOG(Log::sceKernel, "sceKernelDeleteTlspl(%08x)", uid);
 
-		for (SceUID threadID : tls->waitingThreads)
-			HLEKernel::ResumeFromWait(threadID, WAITTYPE_TLSPL, uid, 0);
+		for (SceUID threadID : tls->waitingThreads) {
+			// sceKernelGetTlsAddr returns a null address, _sceKernelAllocateTlspl an error.
+			u32 error;
+			u32 timeoutPtr = __KernelGetWaitTimeoutPtr(threadID, error);
+			HLEKernel::WriteRemainingTimeout(threadID, timeoutPtr);
+			u32 result = __KernelGetWaitValue(threadID, error) != TLSPL_WAITVALUE_RETURN_ADDR ? SCE_KERNEL_ERROR_WAIT_DELETE : 0;
+			HLEKernel::ResumeFromWait(threadID, WAITTYPE_TLSPL, uid, result);
+		}
 		hleReSchedule("deleted tlspl");
 
 		BlockAllocator *allocator = BlockAllocatorFromAddr(tls->address);
@@ -1980,36 +1985,30 @@ struct FindTLSByIndexArg {
 	TLSPL *result = nullptr;
 };
 
-int sceKernelGetTlsAddr(SceUID uid) {
-	if (!__KernelIsDispatchEnabled() || __IsInInterrupt())
-		return hleLogWarning(Log::sceKernel, 0, "dispatch disabled");
-
+static TLSPL *__KernelFindTlspl(SceUID uid) {
 	u32 error;
 	TLSPL *tls = kernelObjects.Get<TLSPL>(uid, error);
-	if (!tls) {
-		if (uid < 0)
-			return hleLogError(Log::sceKernel, 0, "tlspl not found");
+	if (tls || uid < 0)
+		return tls;
 
-		// There's this weird behavior where it looks up by index.  Maybe we shouldn't use uids...
-		if (!tlsplUsedIndexes[(uid >> 3) & 15])
-			return hleLogError(Log::sceKernel, 0, "tlspl not found");
+	// There's this weird behavior where it looks up by index.  Maybe we shouldn't use uids...
+	if (!tlsplUsedIndexes[(uid >> 3) & 15])
+		return nullptr;
 
-		FindTLSByIndexArg state;
-		state.index = (uid >> 3) & 15;
-		kernelObjects.Iterate<TLSPL>([&state](int id, TLSPL *possible) {
-			if (possible->ntls.index == state.index) {
-				state.result = possible;
-				return false;
-			}
-			return true;
-		});
+	FindTLSByIndexArg state;
+	state.index = (uid >> 3) & 15;
+	kernelObjects.Iterate<TLSPL>([&state](int id, TLSPL *possible) {
+		if (possible->ntls.index == state.index) {
+			state.result = possible;
+			return false;
+		}
+		return true;
+	});
+	return state.result;
+}
 
-		if (!state.result)
-			return hleLogError(Log::sceKernel, 0, "tlspl not found");
-
-		tls = state.result;
-	}
-
+// Returns the current thread's block in the pool, allocating it if needed, or 0 if the pool is full.
+static u32 __KernelAllocateTls(TLSPL *tls) {
 	SceUID threadID = __KernelGetCurThread();
 	int allocBlock = -1;
 	bool needsClear = false;
@@ -2034,18 +2033,14 @@ int sceKernelGetTlsAddr(SceUID uid) {
 		if (allocBlock != -1)
 		{
 			tls->usage[allocBlock] = threadID;
-			tlsplThreadEndChecks.emplace(threadID, uid);
+			tlsplThreadEndChecks.emplace(threadID, tls->GetUID());
 			--tls->ntls.freeBlocks;
 			needsClear = true;
 		}
 	}
 
 	if (allocBlock == -1)
-	{
-		tls->waitingThreads.push_back(threadID);
-		__KernelWaitCurThread(WAITTYPE_TLSPL, uid, 1, 0, false, "allocate tls");
-		return hleLogDebug(Log::sceKernel, 0, "waiting for tls alloc");
-	}
+		return 0;
 
 	u32 alignedSize = (tls->ntls.blockSize + tls->alignment - 1) & ~(tls->alignment - 1);
 	u32 allocAddress = tls->address + allocBlock * alignedSize;
@@ -2055,8 +2050,69 @@ int sceKernelGetTlsAddr(SceUID uid) {
 	if (needsClear) {
 		Memory::Memset(allocAddress, 0, tls->ntls.blockSize, "TlsAddr");
 	}
+	return allocAddress;
+}
 
+int sceKernelGetTlsAddr(SceUID uid) {
+	if (!__KernelIsDispatchEnabled() || __IsInInterrupt())
+		return hleLogWarning(Log::sceKernel, 0, "dispatch disabled");
+
+	TLSPL *tls = __KernelFindTlspl(uid);
+	if (!tls)
+		return hleLogError(Log::sceKernel, 0, "tlspl not found");
+
+	u32 allocAddress = __KernelAllocateTls(tls);
+	if (allocAddress == 0) {
+		SceUID threadID = __KernelGetCurThread();
+		tls->waitingThreads.push_back(threadID);
+		__KernelWaitCurThread(WAITTYPE_TLSPL, tls->GetUID(), TLSPL_WAITVALUE_RETURN_ADDR, 0, false, "allocate tls");
+		return hleLogDebug(Log::sceKernel, 0, "waiting for tls alloc");
+	}
 	return hleLogDebug(Log::sceKernel, allocAddress);
+}
+
+void __KernelTlsplTimeout(u64 userdata, int cyclesLate) {
+	SceUID threadID = (SceUID)userdata;
+	HLEKernel::WaitExecTimeout<TLSPL, WAITTYPE_TLSPL>(threadID);
+}
+
+// The kernel's check on a pointer from user mode: neither end may be a kernel address.
+static bool __KernelIsBadUserPtr(u32 ptr, u32 size) {
+	if (!__KernelCurThreadIsKernelMode() && ((ptr | (ptr + size)) & 0x80000000) != 0)
+		return true;
+	return ptr != 0 && !Memory::IsValidRange(ptr, size);
+}
+
+// The syscall behind usersystemlib's sceKernelGetTlsAddr, which calls it as (uid, &addr, NULL) when
+// the thread's cached address is null. Homebrew that has to run before usersystemlib.prx is loaded
+// (like plugins) inlines that code, so it imports this directly. Checked against threadman.prx.
+// We don't fill in the per-thread cache at $k0+0x40, so callers always take this path.
+int _sceKernelAllocateTlspl(SceUID uid, u32 addrPtr, u32 timeoutPtr) {
+	if (__KernelIsBadUserPtr(addrPtr, 4) || addrPtr == 0 || __KernelIsBadUserPtr(timeoutPtr, 4))
+		return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ADDR, "bad pointer");
+	if (__IsInInterrupt())
+		return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_CONTEXT, "in interrupt");
+	if (!__KernelIsDispatchEnabled())
+		return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_CAN_NOT_WAIT, "dispatch disabled");
+
+	// Unlike sceKernelGetTlsAddr, no lookup by index.
+	u32 error;
+	TLSPL *tls = kernelObjects.Get<TLSPL>(uid, error);
+	if (!tls)
+		return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_UNKNOWN_TLSPL_ID, "tlspl not found");
+
+	u32 allocAddress = __KernelAllocateTls(tls);
+	if (allocAddress == 0) {
+		if (__KernelWaitTimesOutAtOnce(timeoutPtr))
+			return hleLogDebug(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT, "timed out at once");
+		SceUID threadID = __KernelGetCurThread();
+		tls->waitingThreads.push_back(threadID);
+		__KernelWaitCurThreadWithTimeout(WAITTYPE_TLSPL, uid, addrPtr, timeoutPtr, false, "allocate tls");
+		return hleLogDebug(Log::sceKernel, 0, "waiting for tls alloc");
+	}
+
+	Memory::WriteOrException_U32(allocAddress, addrPtr);
+	return hleLogDebug(Log::sceKernel, 0, "addr=%08x", allocAddress);
 }
 
 // Parameters are an educated guess.

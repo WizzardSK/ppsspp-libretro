@@ -92,6 +92,7 @@ void TouchControlVisibilityScreen::CreateDialogViews(UI::ViewGroup *parent) {
 	toggles_.push_back({ "R", &touch.touchRKey.show, ImageID("I_R"), nullptr });
 	toggles_.push_back({ "Start", &touch.touchStartKey.show, ImageID("I_START"), nullptr });
 	toggles_.push_back({ "Select", &touch.touchSelectKey.show, ImageID("I_SELECT"), nullptr });
+	toggles_.push_back({ "Home", &touch.touchHomeKey.show, ImageID("I_HOME"), nullptr });
 	toggles_.push_back({ "Dpad", &touch.touchDpad.show, ImageID::invalid(), nullptr });
 	toggles_.push_back({ "Analog Stick", &touch.touchAnalogStick.show, ImageID::invalid(), nullptr });
 	toggles_.push_back({ "Right Analog Stick", &touch.touchRightAnalogStick.show, ImageID::invalid(), [=](EventParams &e) {
@@ -122,7 +123,7 @@ void TouchControlVisibilityScreen::CreateDialogViews(UI::ViewGroup *parent) {
 			char translated[256];
 			int i = 0;
 			if (sscanf(toggle.key.c_str(), "Custom %d", &i) == 1) {
-				snprintf(translated, sizeof(translated), mc->T_cstr("Custom %d"), i);
+				truncate_cpy(translated, sizeof(translated), ApplySafeSubstitutions(mc->T("Custom %1"), i).c_str());
 			} else {
 				truncate_cpy(translated, sizeof(translated), mc->T(toggle.key));
 			}

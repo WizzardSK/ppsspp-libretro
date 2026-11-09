@@ -50,11 +50,24 @@
 
 SymbolMap *g_symbolMap;
 
+// Not per-instance, so that versions from a map that's been thrown away (one is created and
+// destroyed per game boot) can't collide with the current one's. See SymbolMap::Version.
+static uint32_t g_symbolMapVersionCounter;
+
+SymbolMap::SymbolMap() {
+	Bump();
+}
+
+void SymbolMap::Bump() {
+	version_ = ++g_symbolMapVersionCounter;
+}
+
 void SymbolMap::SortSymbols() {
 	AssignFunctionIndices();
 }
 
 void SymbolMap::Clear() {
+	Bump();
 	functions.clear();
 	labels.clear();
 	data.clear();
@@ -66,8 +79,11 @@ void SymbolMap::Clear() {
 	activeNeedUpdate_ = false;
 }
 
+// Merges into what's there rather than clearing it: while a game runs, the map knows which modules are
+// loaded and where (the file only knows where they were when it was saved), and has the import stubs, which
+// are skipped below. At boot the map is empty anyway.
 bool SymbolMap::LoadSymbolMap(const Path &filename) {
-	Clear();
+	Bump();
 
 	// TODO(scoped): Use gzdopen instead.
 
@@ -88,6 +104,8 @@ bool SymbolMap::LoadSymbolMap(const Path &filename) {
 
 	bool started = false;
 	bool hasModules = false;
+	// The file's module indexes, to ours.
+	std::unordered_map<int, int> moduleIndexes;
 
 	while (!gzeof(f)) {
 		char line[512], temp[256] = {0};
@@ -95,11 +113,10 @@ bool SymbolMap::LoadSymbolMap(const Path &filename) {
 		if (p == NULL)
 			break;
 
-		// Chop any newlines off.
-		for (size_t i = strlen(line) - 1; i > 0; i--) {
-			if (line[i] == '\r' || line[i] == '\n') {
-				line[i] = '\0';
-			}
+		// Chop any newlines off. The line can be empty, if it starts with a NUL.
+		size_t len = strlen(line);
+		while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) {
+			line[--len] = '\0';
 		}
 
 		if (strlen(line) < 4 || sscanf(line, "%255s", temp) != 1)
@@ -128,21 +145,26 @@ bool SymbolMap::LoadSymbolMap(const Path &filename) {
 		int moduleIndex = 0;
 		int typeInt = ST_NONE;
 		SymbolType type;
-		char name[128] = {0};
+		char name[256] = {0};
 
-		if (sscanf(line, ".module %x %08x %08x %127c", (unsigned int *)&moduleIndex, &address, &size, name) >= 3) {
-			// Found a module definition.
-			ModuleEntry mod;
-			mod.index = moduleIndex;
-			strcpy(mod.name, name);
-			mod.start = address;
-			mod.size = size;
-			modules.push_back(mod);
+		if (sscanf(line, ".module %x %08x %08x %255c", (unsigned int *)&moduleIndex, &address, &size, name) >= 3) {
+			// Found a module definition. One we know by that name (preferably loaded) is the same module.
+			int ourIndex = GetModuleIndexByName(name);
+			if (ourIndex < 0) {
+				ModuleEntry mod;
+				mod.index = NextModuleIndex();
+				truncate_cpy(mod.name, name);
+				mod.start = address;
+				mod.size = size;
+				modules.push_back(mod);
+				ourIndex = mod.index;
+			}
+			moduleIndexes[moduleIndex] = ourIndex;
 			hasModules = true;
 			continue;
 		}
 
-		const int matched = sscanf(line, "%08x %08x %x %i %127c", &address, &size, &vaddress, &typeInt, name);
+		const int matched = sscanf(line, "%08x %08x %x %i %255c", &address, &size, &vaddress, &typeInt, name);
 		if (matched < 1)
 			continue;
 		type = (SymbolType) typeInt;
@@ -152,8 +174,9 @@ bool SymbolMap::LoadSymbolMap(const Path &filename) {
 				continue;
 			}
 		} else {
-			// The 3rd field is now used for the module index.
-			moduleIndex = vaddress;
+			// The 3rd field is now used for the module index. 0 (or an unknown one) is an absolute address.
+			const auto ourIndex = moduleIndexes.find((int)vaddress);
+			moduleIndex = ourIndex != moduleIndexes.end() ? ourIndex->second : 0;
 			vaddress = GetModuleAbsoluteAddr(address, moduleIndex);
 			if (!Memory::IsValidAddress(vaddress)) {
 				ERROR_LOG(Log::Loader, "Invalid address in symbol file: %08x (%s)", vaddress, name);
@@ -172,18 +195,20 @@ bool SymbolMap::LoadSymbolMap(const Path &filename) {
 		if (strncmp(name, "zz_[UNK", 7) == 0)
 			continue;
 
-		if (!strcmp(name, ".text") || !strcmp(name, ".init") || strlen(name) <= 1) {
+		// Data can be unnamed.
+		const bool unnamedData = type == ST_DATA && name[0] == 0;
+		if (!strcmp(name, ".text") || !strcmp(name, ".init") || (strlen(name) <= 1 && !unnamedData)) {
 			// Ignored
 		} else {
-			// Seems legit
+			// Seems legit. The file's names win over the ones already here.
 			switch (type) {
 			case ST_FUNCTION:
-				AddFunction(name, vaddress, size, moduleIndex);
+				AddFunction(name, vaddress, size, moduleIndex, true);
 				break;
 			case ST_DATA:
 				AddData(vaddress,size,DATATYPE_BYTE, moduleIndex);
 				if (name[0] != 0)
-					AddLabel(name, vaddress, moduleIndex);
+					AddLabel(name, vaddress, moduleIndex, true);
 				break;
 			case ST_NONE:
 			case ST_ALL:
@@ -215,7 +240,9 @@ bool SymbolMap::SaveSymbolMap(const Path &filename) const {
 	}
 
 	for (const auto &[key, e] : data) {
-		buf.Printf("%08x %08x %x %i %s\n", e.start, e.size, e.module, ST_DATA, GetLabelNameRel(e.start, e.module));
+		// Data can be unnamed, and printf would write "(null)" (which would come back as a name).
+		const char *name = GetLabelNameRel(e.start, e.module);
+		buf.Printf("%08x %08x %x %i %s\n", e.start, e.size, e.module, ST_DATA, name ? name : "");
 	}
 
 	std::string data;
@@ -303,8 +330,8 @@ bool SymbolMap::LoadNocashSym(const Path &filename) {
 		return false;
 
 	while (!feof(f)) {
-		char line[256], value[256] = {0};
-		char *p = fgets(line, 256, f);
+		char line[512], value[256] = {0};
+		char *p = fgets(line, sizeof(line), f);
 		if (p == NULL)
 			break;
 
@@ -325,13 +352,13 @@ bool SymbolMap::LoadNocashSym(const Path &filename) {
 					continue;
 
 				if (strcasecmp(value, ".byt") == 0) {
-					AddData(address, size, DATATYPE_BYTE, 0);
+					AddData(address, size, DATATYPE_BYTE);
 				} else if (strcasecmp(value, ".wrd") == 0) {
-					AddData(address, size, DATATYPE_HALFWORD, 0);
+					AddData(address, size, DATATYPE_HALFWORD);
 				} else if (strcasecmp(value, ".dbl") == 0) {
-					AddData(address, size, DATATYPE_WORD, 0);
+					AddData(address, size, DATATYPE_WORD);
 				} else if (strcasecmp(value, ".asc") == 0) {
-					AddData(address, size, DATATYPE_ASCII, 0);
+					AddData(address, size, DATATYPE_ASCII);
 				}
 			}
 		} else {				// labels
@@ -342,10 +369,12 @@ bool SymbolMap::LoadNocashSym(const Path &filename) {
 				sscanf(separator + 1, "%08X", &size);
 			}
 
+			// The file only has absolute addresses. Attached to the loaded module they're in (if any), they
+			// move with it. The file's names win over the ones already here.
 			if (size != 1) {
-				AddFunction(value, address, size, 0);
+				AddFunction(value, address, size, -1, true);
 			} else {
-				AddLabel(value, address, 0);
+				AddLabel(value, address, -1, true);
 			}
 		}
 	}
@@ -366,7 +395,12 @@ bool SymbolMap::SaveNocashSym(const Path &filename) const {
 	// only write functions, the rest isn't really interesting
 	for (auto it = functions.begin(), end = functions.end(); it != end; ++it) {
 		const FunctionEntry& e = it->second;
-		fprintf(f, "%08X %s,%04X\n", GetModuleAbsoluteAddr(e.start,e.module), GetLabelNameRel(e.start, e.module), e.size);
+		// The file only has absolute addresses, and a module that isn't loaded has none.
+		if (!IsModuleActive(e.module)) {
+			continue;
+		}
+		const char *name = GetLabelNameRel(e.start, e.module);
+		fprintf(f, "%08X %s,%04X\n", GetModuleAbsoluteAddr(e.start,e.module), name ? name : "", e.size);
 	}
 
 	fclose(f);
@@ -768,6 +802,8 @@ std::vector<SymbolEntry> SymbolMap::GetAllActiveSymbols(SymbolType symbolMask) {
 }
 
 void SymbolMap::AddModule(const char *name, u32 address, u32 size, u32 crc) {
+	Bump();
+
 	for (auto &module : modules) {
 		if (equals(module.name, name)) {
 			// A name match alone isn't proof it's really the same module reloading - some
@@ -795,14 +831,24 @@ void SymbolMap::AddModule(const char *name, u32 address, u32 size, u32 crc) {
 	mod.start = address;
 	mod.size = size;
 	mod.crc = crc;
-	mod.index = (int)modules.size() + 1;
+	mod.index = NextModuleIndex();
 
 	modules.push_back(mod);
 	activeModuleEnds.emplace(mod.start + mod.size, mod);
 	activeNeedUpdate_ = true;
 }
 
+int SymbolMap::NextModuleIndex() const {
+	// Not modules.size() + 1: a symbol map can bring modules with any index.
+	int index = 0;
+	for (const auto &module : modules) {
+		index = std::max(index, module.index);
+	}
+	return index + 1;
+}
+
 void SymbolMap::UnloadModule(u32 address, u32 size) {
+	Bump();
 	activeModuleEnds.erase(address + size);
 	activeNeedUpdate_ = true;
 }
@@ -876,7 +922,7 @@ int SymbolMap::GetModuleIndexByName(const std::string &name) const {
 	return found;
 }
 
-bool SymbolMap::IsModuleActive(int moduleIndex) {
+bool SymbolMap::IsModuleActive(int moduleIndex) const {
 	if (moduleIndex == 0) {
 		return true;
 	}
@@ -907,6 +953,8 @@ std::vector<LoadedModuleInfo> SymbolMap::getAllModules() const {
 }
 
 void SymbolMap::AddFunction(const char* name, u32 address, u32 size, int moduleIndex, bool updateName) {
+	Bump();
+
 	moduleIndex = ResolveModuleIndex(address, moduleIndex);
 
 	// Is there an existing one?
@@ -1116,6 +1164,8 @@ void SymbolMap::UpdateActiveSymbols() {
 }
 
 bool SymbolMap::SetFunctionSize(u32 startAddress, u32 newSize) {
+	Bump();
+
 	if (activeNeedUpdate_)
 		UpdateActiveSymbols();
 
@@ -1136,6 +1186,8 @@ bool SymbolMap::SetFunctionSize(u32 startAddress, u32 newSize) {
 }
 
 bool SymbolMap::RemoveFunction(u32 startAddress, bool removeName) {
+	Bump();
+
 	if (activeNeedUpdate_)
 		UpdateActiveSymbols();
 
@@ -1167,6 +1219,8 @@ bool SymbolMap::RemoveFunction(u32 startAddress, bool removeName) {
 }
 
 void SymbolMap::AddLabel(const char* name, u32 address, int moduleIndex, bool updateName) {
+	Bump();
+
 	moduleIndex = ResolveModuleIndex(address, moduleIndex);
 
 	// Is there an existing one?
@@ -1225,6 +1279,8 @@ void SymbolMap::AddLabel(const char* name, u32 address, int moduleIndex, bool up
 }
 
 void SymbolMap::SetLabelName(const char* name, u32 address) {
+	Bump();
+
 	if (activeNeedUpdate_)
 		UpdateActiveSymbols();
 
@@ -1236,7 +1292,7 @@ void SymbolMap::SetLabelName(const char* name, u32 address) {
 		auto label = labels.find(symbolKey);
 		if (label != labels.end()) {
 			truncate_cpy(label->second.name, name);
-			label->second.name[127] = 0;
+			label->second.name[255] = 0;
 
 			// Refresh the active item if it exists.
 			auto active = activeLabels.find(address);
@@ -1289,6 +1345,8 @@ bool SymbolMap::GetLabelValue(const char* name, u32& dest) {
 }
 
 void SymbolMap::AddData(u32 address, u32 size, DataType type, int moduleIndex) {
+	Bump();
+
 	moduleIndex = ResolveModuleIndex(address, moduleIndex);
 
 	// Is there an existing one?
@@ -1395,6 +1453,8 @@ DataType SymbolMap::GetDataType(u32 startAddress) {
 }
 
 bool SymbolMap::RemoveData(u32 startAddress, bool removeName) {
+	Bump();
+
 	if (activeNeedUpdate_)
 		UpdateActiveSymbols();
 

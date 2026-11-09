@@ -109,13 +109,17 @@ struct GLRRenderData {
 			GLRInputLayout *inputLayout;
 			GLRBuffer *vertexBuffer;
 			GLRBuffer *indexBuffer;
+			// For the input layout's stream 1.
+			GLRBuffer *vertexBuffer1;
 			uint32_t vertexOffset;
 			uint32_t indexOffset;
+			uint32_t vertexOffset1;
 			GLenum mode;  // primitive
 			GLint first;
 			GLint count;
 			GLint indexType;
 			GLint instances;
+			GLint maxIndex;  // -1 if unknown. Otherwise, all indices are known to be <= maxIndex.
 		} draw;
 		struct {
 			const char *name;  // if null, use loc
@@ -214,6 +218,7 @@ enum class GLRInitStepType : uint8_t {
 	CREATE_FRAMEBUFFER,
 
 	TEXTURE_IMAGE,
+	TEXTURE_SUBIMAGE,
 	TEXTURE_FINALIZE,
 	BUFFER_SUBDATA,
 };
@@ -266,6 +271,17 @@ struct GLRInitStep {
 			bool linearFilter;
 			uint8_t *data;  // owned, delete[]-d
 		} texture_image;
+		struct {
+			GLRTexture *texture;
+			Draw::DataFormat format;
+			int level;
+			uint16_t x;
+			uint16_t y;
+			uint16_t width;
+			uint16_t height;
+			GLRAllocType allocType;
+			uint8_t *data;  // owned, delete[]-d
+		} texture_subimage;
 		struct {
 			GLRTexture *texture;
 			int loadedLevels;
@@ -353,18 +369,26 @@ public:
 		caps_ = caps;
 	}
 
-	void RunInitSteps(const FastVec<GLRInitStep> &steps, bool skipGLCalls);
+	// dryRun: the steps will never run (left over at shutdown), so only free what they own.
+	void RunInitSteps(const FastVec<GLRInitStep> &steps, bool dryRun);
 
-	void RunSteps(const std::vector<GLRStep *> &steps, GLFrameData &frameData, bool skipGLCalls, bool keepSteps, bool useVR);
+	void RunSteps(const std::vector<GLRStep *> &steps, GLFrameData &frameData, bool dryRun, bool keepSteps, bool useVR);
 
 	void CreateDeviceObjects();
 	void DestroyDeviceObjects();
 
-	void CopyFromReadbackBuffer(GLRFramebuffer *framebuffer, int width, int height, Draw::DataFormat srcFormat, Draw::DataFormat destFormat, int pixelStride, uint8_t *pixels);
+	// Converts the last readback to destFormat. Returns false if that read failed or can't be converted.
+	bool CopyFromReadbackBuffer(GLRFramebuffer *framebuffer, int width, int height, Draw::DataFormat destFormat, int pixelStride, uint8_t *pixels);
 
 	void Resize(int width, int height) {
 		targetWidth_ = width;
 		targetHeight_ = height;
+	}
+
+	// Deleting a framebuffer leaves the default one bound, behind fbo_bind_fb_target's cache.
+	void ForgetBoundFramebuffers() {
+		currentDrawHandle_ = 0;
+		currentReadHandle_ = 0;
 	}
 
 	std::string GetGLString(int name) const;
@@ -401,7 +425,9 @@ private:
 	// We size it generously.
 	uint8_t *readbackBuffer_ = nullptr;
 	int readbackBufferSize_ = 0;
-	uint32_t readbackAspectMask_ = 0;
+	// What the last readback actually read, and whether it succeeded.
+	Draw::DataFormat readbackFormat_ = Draw::DataFormat::UNDEFINED;
+	bool readbackOk_ = false;
 
 	float maxAnisotropyLevel_ = 0.0f;
 
@@ -412,6 +438,8 @@ private:
 	std::unordered_map<int, std::string> glStrings_;
 
 	bool sawOutOfMemory_ = false;
+	// On from the first render pass of a frame to the last (a clear turns it off and on again within a pass).
+	bool scissorTestOn_ = false;
 	bool useDebugGroups_ = false;
 
 	GLProfiler profiler_;

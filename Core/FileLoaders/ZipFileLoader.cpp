@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 #ifdef SHARED_LIBZIP
 #include <zip.h>
 #else
@@ -61,9 +63,23 @@ bool ZipFileLoader::Initialize(int fileIndex) {
 		ERROR_LOG(Log::IO, "Failed to get name for file index %d", fileIndex);
 		return false;
 	}
+	// Callers (Identify_File and friends) compare against lowercase extensions, like
+	// Path::GetFileExtension returns. Not using tolower to avoid the Turkish I problem.
 	fileExtension_ = KeepIncludingLast(name, '.');
+	for (size_t i = 0; i < fileExtension_.size(); i++) {
+		char c = fileExtension_[i];
+		if (c >= 'A' && c <= 'Z') {
+			fileExtension_[i] = c + ('a' - 'A');
+		}
+	}
 
 	_dbg_assert_(zstat.index == fileIndex);
+	// The whole file is decompressed into memory. No disc image is anywhere near 4GB, and the
+	// size has to fit in a (possibly 32-bit) size_t too.
+	if (!(zstat.valid & ZIP_STAT_SIZE) || zstat.size > (4ULL << 30) || zstat.size > (u64)SIZE_MAX) {
+		ERROR_LOG(Log::IO, "File index %d in ZIP has an implausible size (%llu)", fileIndex, (unsigned long long)zstat.size);
+		return false;
+	}
 	dataFileSize_ = zstat.size;
 	dataFile_ = zip_fopen_index(zipArchive_, zstat.index, ZIP_FL_UNCHANGED);
 	if (!dataFile_) {

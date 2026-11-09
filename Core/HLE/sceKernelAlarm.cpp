@@ -15,6 +15,7 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
 #include <list>
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
@@ -69,12 +70,17 @@ public:
 	bool run(PendingInterrupt& pend) override
 	{
 		u32 error;
+		if (triggeredAlarm.empty()) {
+			return false;
+		}
 		int alarmID = triggeredAlarm.front();
 
 		PSPAlarm *alarm = kernelObjects.Get<PSPAlarm>(alarmID, error);
 		if (error)
 		{
+			// handleResult won't run, so the alarm is popped here, or every later alarm runs this one's entry.
 			WARN_LOG(Log::sceKernel, "Ignoring deleted alarm %08x", alarmID);
+			triggeredAlarm.pop_front();
 			return false;
 		}
 
@@ -95,10 +101,15 @@ public:
 		// A non-zero result means to reschedule.
 		if (result > 0)
 		{
-			DEBUG_LOG(Log::sceKernel, "Rescheduling alarm %08x for +%dms", alarmID, result);
 			u32 error;
 			PSPAlarm *alarm = kernelObjects.Get<PSPAlarm>(alarmID, error);
-			__KernelScheduleAlarm(alarm, result);
+			if (alarm) {
+				DEBUG_LOG(Log::sceKernel, "Rescheduling alarm %08x for +%dus", alarmID, result);
+				__KernelScheduleAlarm(alarm, result);
+			} else {
+				// The handler can have deleted its own alarm, in which case there's nothing to reschedule.
+				WARN_LOG(Log::sceKernel, "Alarm %08x requested a reschedule but no longer exists", alarmID);
+			}
 		}
 		else
 		{
@@ -130,6 +141,9 @@ void __KernelAlarmInit()
 {
 	triggeredAlarm.clear();
 	__RegisterIntrHandler(PSP_SYSTIMER0_INTR, new AlarmIntrHandler());
+	// On hardware a thread that keeps running loses ~70us to an alarm handler, and one the handler
+	// wakes runs ~50us after it (pspautotests threads/scheduling/alarmcosts).
+	__SetIntrHandlerCosts(PSP_SYSTIMER0_INTR, (int)usToCycles(17), (int)usToCycles(40));
 	alarmTimer = CoreTiming::RegisterEvent("Alarm", __KernelTriggerAlarm);
 }
 
@@ -149,9 +163,14 @@ KernelObject *__KernelAlarmObject() {
 	return new PSPAlarm();
 }
 
+// Re-arms an alarm from its handler's return value. That counts from the previous deadline, so a
+// repeating alarm doesn't drift by the time it takes to get into and out of the handler
+// (pspautotests threads/alarm/set) - unless that's already gone by, say with interrupts suspended
+// for a while, when it counts from now instead of firing to catch up (threads/alarm/alarm).
 void __KernelScheduleAlarm(PSPAlarm *alarm, u64 micro) {
-	alarm->alm.schedule = CoreTiming::GetGlobalTimeUs() + micro;
-	CoreTiming::ScheduleEvent(usToCycles(micro), alarmTimer, alarm->GetUID());
+	const u64 now = CoreTiming::GetGlobalTimeUs();
+	alarm->alm.schedule = alarm->alm.schedule + micro > now ? alarm->alm.schedule + micro : now + micro;
+	CoreTiming::ScheduleEvent(usToCycles(alarm->alm.schedule - now), alarmTimer, alarm->GetUID());
 }
 
 static SceUID __KernelSetAlarm(u64 micro, u32 handlerPtr, u32 commonPtr)
@@ -166,7 +185,14 @@ static SceUID __KernelSetAlarm(u64 micro, u32 handlerPtr, u32 commonPtr)
 	alarm->alm.handlerPtr = handlerPtr;
 	alarm->alm.commonPtr = commonPtr;
 
-	__KernelScheduleAlarm(alarm, micro);
+	// On hardware the call takes about 40us, and the alarm doesn't go off sooner than about 215us
+	// after the deadline is taken however short it's asked to be (pspautotests
+	// threads/scheduling/alarmcosts). The status still shows the time asked for.
+	hleEatCycles(usToCycles(20));
+	alarm->alm.schedule = CoreTiming::GetGlobalTimeUs() + micro;
+	// Clamped to a few thousand years, so the conversion to cycles doesn't overflow.
+	CoreTiming::ScheduleEvent(usToCycles((s64)std::clamp(micro, (u64)215, (u64)1 << 52)), alarmTimer, alarm->GetUID());
+	hleEatCycles(usToCycles(20));
 	return uid;
 }
 
@@ -176,10 +202,11 @@ SceUID sceKernelSetAlarm(SceUInt micro, u32 handlerPtr, u32 commonPtr) {
 
 SceUID sceKernelSetSysClockAlarm(u32 microPtr, u32 handlerPtr, u32 commonPtr) {
 	u64 micro;
-	if (Memory::IsValid4AlignedAddress(microPtr))  // 8-aligned?
+	// Note: we read 8 bytes here, so the whole range has to be valid, not just the first word.
+	if (Memory::IsValid4AlignedRange(microPtr, 8))
 		micro = Memory::ReadUnchecked_U64(microPtr);
 	else
-		return -1;
+		return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ADDR, "invalid microPtr");
 
 	return hleLogDebug(Log::sceKernel, __KernelSetAlarm(micro, handlerPtr, commonPtr));
 }

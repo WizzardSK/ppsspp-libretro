@@ -15,6 +15,15 @@
 
 #include "Common/GPU/OpenGL/GLFeatures.h"
 
+// The EXT spellings come from EXT_clip_cull_distance, which the Switch's GL
+// headers do not carry - the core names are there and hold the same values.
+#if !defined(GL_MAX_CLIP_DISTANCES_EXT) && defined(GL_MAX_CLIP_DISTANCES)
+#define GL_MAX_CLIP_DISTANCES_EXT GL_MAX_CLIP_DISTANCES
+#endif
+#if !defined(GL_MAX_CULL_DISTANCES_EXT) && defined(GL_MAX_CULL_DISTANCES)
+#define GL_MAX_CULL_DISTANCES_EXT GL_MAX_CULL_DISTANCES
+#endif
+
 #include "Common/Log.h"
 
 #if defined(USING_GLES2)
@@ -30,6 +39,7 @@ PFNGLGENVERTEXARRAYSOESPROC glGenVertexArraysOES;
 PFNGLBINDVERTEXARRAYOESPROC glBindVertexArrayOES;
 PFNGLDELETEVERTEXARRAYSOESPROC glDeleteVertexArraysOES;
 PFNGLISVERTEXARRAYOESPROC glIsVertexArrayOES;
+PPSSPP_PFNGLCLIPCONTROLEXTPROC glClipControlEXTFunc;
 #endif
 #if !PPSSPP_PLATFORM(IOS)
 #include "EGL/egl.h"
@@ -306,6 +316,13 @@ bool CheckGLExtensions() {
 			// Otherwise, let's trust GL_MAJOR_VERSION.  Note that Mali is intentionally not banned here.
 			if (gl_extensions.ver[0] >= 3) {
 				gl_extensions.GLES3 = gl3stubInit();
+				if (!gl_extensions.GLES3) {
+					// We failed to load the ES3 entry points, so we can't use any of them - including
+					// glGetStringi below, which is one of the ones gl3stubInit() checks for. Drop back
+					// to 2.0 so nothing downstream keys off the version and calls into a null pointer.
+					gl_extensions.ver[0] = 2;
+					gl_extensions.ver[1] = 0;
+				}
 			}
 		}
 #else
@@ -331,6 +348,9 @@ bool CheckGLExtensions() {
 		g_set_gl_extensions.clear();
 		for (GLint i = 0; i < numExtensions; ++i) {
 			const char *ext = (const char *)glGetStringi(GL_EXTENSIONS, i);
+			if (!ext) {
+				continue;
+			}
 			g_set_gl_extensions.insert(ext);
 			g_all_gl_extensions += ext;
 			g_all_gl_extensions += " ";
@@ -371,6 +391,7 @@ bool CheckGLExtensions() {
 	gl_extensions.ARB_draw_instanced = g_set_gl_extensions.count("GL_ARB_draw_instanced") != 0;
 	gl_extensions.ARB_cull_distance = g_set_gl_extensions.count("GL_ARB_cull_distance") != 0;
 	gl_extensions.ARB_depth_clamp = g_set_gl_extensions.count("GL_ARB_depth_clamp") != 0;
+	gl_extensions.ARB_clip_control = g_set_gl_extensions.count("GL_ARB_clip_control") != 0;
 	gl_extensions.ARB_uniform_buffer_object = g_set_gl_extensions.count("GL_ARB_uniform_buffer_object") != 0;
 	gl_extensions.ARB_explicit_attrib_location = g_set_gl_extensions.count("GL_ARB_explicit_attrib_location") != 0;
 	gl_extensions.ARB_texture_non_power_of_two = g_set_gl_extensions.count("GL_ARB_texture_non_power_of_two") != 0;
@@ -397,6 +418,7 @@ bool CheckGLExtensions() {
 		gl_extensions.EXT_buffer_storage = g_set_gl_extensions.count("GL_EXT_buffer_storage") != 0;
 		gl_extensions.EXT_clip_cull_distance = g_set_gl_extensions.count("GL_EXT_clip_cull_distance") != 0;
 		gl_extensions.EXT_depth_clamp = g_set_gl_extensions.count("GL_EXT_depth_clamp") != 0;
+		gl_extensions.EXT_clip_control = g_set_gl_extensions.count("GL_EXT_clip_control") != 0;
 		gl_extensions.EXT_disjoint_timer_query = g_set_gl_extensions.count("GL_EXT_disjoint_timer_query") != 0;
 		gl_extensions.APPLE_clip_distance = g_set_gl_extensions.count("GL_APPLE_clip_distance") != 0;
 
@@ -422,6 +444,11 @@ bool CheckGLExtensions() {
 			glBlitFramebufferNV = (PFNGLBLITFRAMEBUFFERNVPROC)eglGetProcAddress("glBlitFramebufferNV");
 		}
 
+		if (gl_extensions.EXT_clip_control) {
+			glClipControlEXTFunc = (PPSSPP_PFNGLCLIPCONTROLEXTPROC)eglGetProcAddress("glClipControlEXT");
+			gl_extensions.EXT_clip_control = glClipControlEXTFunc != nullptr;
+		}
+
 		gl_extensions.OES_vertex_array_object = g_set_gl_extensions.count("GL_OES_vertex_array_object") != 0;
 		if (gl_extensions.OES_vertex_array_object) {
 			glGenVertexArraysOES = (PFNGLGENVERTEXARRAYSOESPROC)eglGetProcAddress("glGenVertexArraysOES");
@@ -438,6 +465,7 @@ bool CheckGLExtensions() {
 #else
 		gl_extensions.OES_vertex_array_object = false;
 		gl_extensions.EXT_discard_framebuffer = false;
+		gl_extensions.EXT_clip_control = false;
 #endif
 	} else {
 		gl_extensions.ARB_blend_func_extended = g_set_gl_extensions.count("GL_ARB_blend_func_extended") != 0;
@@ -484,8 +512,6 @@ bool CheckGLExtensions() {
 	}
 	ParseExtensionsString(g_all_egl_extensions, g_set_egl_extensions);
 #endif
-
-	glGetIntegerv(GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, &gl_extensions.maxVertexTextureUnits);
 
 #ifdef GL_LOW_FLOAT
 	// This is probably a waste of time, implementations lie.
@@ -564,6 +590,7 @@ bool CheckGLExtensions() {
 			gl_extensions.ARB_buffer_storage = true;
 		}
 		if (gl_extensions.VersionGEThan(4, 5)) {
+			gl_extensions.ARB_clip_control = true;
 			gl_extensions.ARB_cull_distance = true;
 		}
 		if (gl_extensions.VersionGEThan(4, 6)) {
@@ -578,6 +605,15 @@ bool CheckGLExtensions() {
 		// Seeing errors that gl_ClipDistance is undefined.
 		gl_extensions.EXT_clip_cull_distance = false;
 	}
+
+	if (gl_extensions.IsGLES) {
+		gl_extensions.ARB_clip_control = false;
+	}
+#if defined(__LIBRETRO__)
+	// The frontend shares the context, and doesn't expect its clip control changed.
+	gl_extensions.ARB_clip_control = false;
+	gl_extensions.EXT_clip_control = false;
+#endif
 
 	bool clipDistanceSupported = false;
 	bool cullDistanceSupported = false;

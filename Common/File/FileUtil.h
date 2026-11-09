@@ -123,6 +123,14 @@ bool MoveIfFast(const Path &srcFilename, const Path &destFilename);
 // creates an empty file filename, returns true on success 
 bool CreateEmptyFile(const Path &filename);
 
+// Can we actually create files in this directory? Checks by trying, since permission bits
+// don't tell the whole story (Windows ACLs, read-only mounts, ...).
+bool IsDirectoryWritable(const Path &path);
+
+// Set or clear a file's read-only-ness, which is what a FAT read-only attribute maps onto.
+// Returns false where the platform can't express it - notably Android content URIs.
+bool SetFileWritable(const Path &filename, bool writable);
+
 // Opens ini file (cheats, texture replacements etc.)
 // TODO: Belongs in System or something.
 bool OpenFileInEditor(const Path &fileName);
@@ -236,6 +244,9 @@ void InitLibretroVFS(const struct retro_vfs_interface_info *vfs) noexcept;
 // Whole-file reading/writing
 bool WriteStringToFile(bool textFile, std::string_view str, const Path &filename);
 bool WriteDataToFile(bool textFile, const void* data, size_t size, const Path &filename);
+// For a file that's known not to exist yet. On Android content URIs, this saves a round trip to the
+// storage provider, and fails if the file does exist.
+bool WriteDataToNewFile(const void *data, size_t size, const Path &filename);
 
 bool ReadFileToStringOptions(bool textFile, bool allowShort, const Path &path, std::string *str);
 
